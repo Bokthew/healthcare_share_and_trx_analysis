@@ -137,7 +137,7 @@ Other Indonesian words in table and column names: *nasabah* (customer), *instans
 ## Repository Structure
 
 ```text
-transaction-flow-analysis/
+healthcare_share_and_trx_analysis/
 │
 ├── README.md
 └── sql_script.sql
