@@ -2,8 +2,6 @@
 
 A SQL pipeline that measures how much of the Indonesian healthcare ecosystem is already served by **Bank Syariah Indonesia (BSI)**, and maps where money flows inside that ecosystem.
 
-The whole analysis lives in a single script: [`healthcare_share_and_trx_analysis.sql`](./healthcare_share_and_trx_analysis_sql)
-
 ---
 
 ## What it does
