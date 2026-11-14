@@ -1,0 +1,2413 @@
+/* ===========================================================================================
+   HEALTHCARE ECOSYSTEM ANALYSIS:
+   - BSI SHARE (NAME-SIMILARITY MATCHING)
+   - TRANSACTION FLOW ANALYSIS
+   ===========================================================================================
+
+   PURPOSE:
+   Measure how much of the Indonesian healthcare ecosystem is already served by BSI, and where the
+   money flows inside it.
+     PART 1 finds which healthcare-related organisations (clinics, community health centers,
+            hospitals, insurers, pharmacies, medical-device companies, payroll customers) are already
+            BSI customers, by comparing their names with official registers (name similarity).
+     PART 2 pulls the money flows between the parties of the ecosystem (public, BPJS Kesehatan,
+            insurers, healthcare facilities, payroll, pharmaceutical wholesalers, medical devices).
+
+   KEY TERMS
+   - BSI          : the bank (Bank Syariah Indonesia)
+   - DPK          : customer deposits (Dana Pihak Ketiga); "master_dpk_bsi" = master table of BSI deposit customers
+   - CIF / nocif  : customer identification number at the bank
+   - Faskes       : healthcare facility (clinic, community health center or hospital)
+   - Puskesmas    : community health center run by the government
+   - Klinik / RS  : clinic / hospital (Rumah Sakit)
+   - BPJS Kesehatan : the national health insurance agency
+   - PBF          : pharmaceutical wholesaler (Pedagang Besar Farmasi)
+   - Alkes        : medical devices (alat kesehatan)
+   - Nakes        : healthcare worker (tenaga kesehatan)
+   - Masyarakat   : the general public (here: retail customers, individu = 'R')
+   - Principal    : the customer being analysed
+   - Rekanan      : counterparty (the other party in a transaction with the principal)
+   - TFD          : Transaction Flow Diagram (TFD Compre = Corporate/Commercial, TFD Lite = other segments)
+   - Similarity score : 1 - (Levenshtein distance / length of the longer name); 1 = identical names,
+                        a score above 0.9 (hospitals: 0.95) is treated as "same organisation"
+   - flag_exc     : 1 = a similarity match that was rejected after manual review (excluded from the result)
+
+   OTHER INDONESIAN WORDS USED IN TABLE / COLUMN NAMES
+   - nasabah = customer, instansi = institution, nama = name, norek / norekening = account number
+   - pengirim / penerima = sender / receiver, rekening sumber / tujuan = source / destination account
+   - pegawai = employee, asuransi = insurance, apotek = pharmacy, farmasi = pharmaceutical
+   - emas = gold, kesehatan = health, kemkes / kemenkes = Ministry of Health, rumahsakit = hospital
+
+   DATES USED (hard-coded in the queries; update them for a new run)
+   - master_dpk_bsi snapshot          : 2026-07-26 (clinics, hospitals, insurers, pharmacies, medical devices)
+                                        2026-08-30 (puskesmas)   2026-08-04 (payroll, facility view)
+                                        2026-08-31 (all transaction steps, Part 2)
+   - Ministry of Health clinic scrape : 2026-06-08 (batch date of the Data Management team)
+   - Payroll data snapshot            : 2026-06-30 (Part 1)   |   2026-01-01 to 2026-08-31 (Part 2)
+   - Transactions (DMX / TFD)         : 2026-01-01 to 2026-08-31
+
+   LIST OF STEPS
+   PART 1 - Which healthcare organisations are BSI customers? (name similarity)
+     1.  Shared lookup: cleaned names of BSI corporate customers
+     2.  Clinics
+     3.  Community health centers (puskesmas)
+     4.  Hospitals
+     5.  Insurance companies
+     6.  Payroll customers - facility view
+     7.  Payroll customers - employee view (healthcare workers)
+     8.  Pharmacies and pharmaceutical companies
+     9.  Medical-device (alkes) companies
+   PART 2 - Money flows inside the healthcare ecosystem
+     10. Shared lookup: universe of healthcare-facility names
+     11. Shared lookup: combined TFD table (Corporate/Commercial + other segments), Jan-Aug
+     12. Flow A : public -> BPJS Kesehatan
+     13. Flow B : public -> insurance companies
+     14. Flow C : public -> healthcare facilities
+     15. Flow D : BPJS Kesehatan -> healthcare facilities
+     16. Flow E : insurance companies -> healthcare facilities
+     17. Flow F : healthcare facilities -> payroll
+     18. Flow G : healthcare facilities -> pharmaceutical wholesalers (PBF)
+     19. Flow H : healthcare facilities -> medical-device (alkes) companies
+     20. Summary of all outgoing facility transactions (PBF + alkes)
+   =========================================================================================== */
+
+/* ==============================================================================
+   PART 1 - WHICH HEALTHCARE ORGANISATIONS ARE BSI CUSTOMERS? (NAME SIMILARITY)
+   ============================================================================== */
+
+/* ---------------------------------------------------------------------
+   STEP 1 : SHARED LOOKUP - CLEANED NAMES OF BSI CORPORATE CUSTOMERS
+   Purpose : Clean the customer names in the deposit master (remove legal-form words such as PT / CV / TBK / LTD
+             and hospital prefixes such as RS, RSUD) so that they can be compared with official registers.
+   Source  : edl_datamart.master_dpk_bsi (corporate customers only, individu = 'C')
+   Result  : edl_sandbox.da_wholesale_dpk_clean_pt   (used by Steps 2, 4, 8 and 9)
+   NOTE    : The line breaks inside the long name patterns (here and in Steps 2 and 4) are part of the original text. Pattern items
+             that start right after a line break cannot match a name, so they have no effect. Kept as-is so results do not change.
+   --------------------------------------------------------------------- */
+
+-- Cleaned corporate-customer names from the BSI deposit (DPK) master, so that name variations can be matched
+-- drop table edl_sandbox.da_wholesale_dpk_clean_pt
+CREATE TABLE edl_sandbox.da_wholesale_dpk_clean_pt
+STORED AS PARQUET
+AS
+SELECT
+    nocif,
+    namacif,
+    UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(namacif,'[^a-zA-Z0-9 ]',''),
+                            '\\s+',' '),
+                            '\\b(PT|CV|TBK|LTD)\\b',''),
+                            '(^| )(RS UMUM DAERAH|RS UMUM|RS IBU DAN ANAK|RS GIGI DAN MULUT|RS JIWA|RS ANGKATAN DARAT|RS ANGKATAN LAUT|RS ANGKATAN UDARA|RS BEDAH|RS DAERAH|RS GIGI MULUT|RS IBU ANAK|RS ISLAM|RS KHUSUS BEDAH|
+                                RS KHUSUS GIGI DAN MULUT|RS KHUSUS GINJAL|RS KHUSUS IBU DAN ANAK|RS KHUSUS MATA|RS GIGI DAN MULUT|RS IBU DAN ANAK|RS JANTUNG DAN PEMBULUH DARAH|RS JIWA DAERAH|RS KHUSUS DAERAH GIGI DAN MULUT|
+                                RS KHUSUS IBU ANAK|RS KHUSUS GIGI DAN MULUT|
+                                RSK BEDAH|RSPAD|RSKJKO|RSUDZA|RSUPN|RSIGM|RSKIA|RSPAU|RUMKITBAN|RUMKITAL|RSUD|RSUP|RSIA|RSAB|RSKO|RSPAL|RSGM|RSAU|RSPI|RSNU|RSPKU|RSJD|RSU|RSI|RSM|RSJ|RSB|RST|RSD|RSA|RS|BOKPKM|BOK PKM|)( |$)', ' '),
+                            '\\s+',' ')))
+        AS namacif_clean,
+    segmenbsi,
+    kodebu,
+    --jenisproduk,
+    batch_date
+FROM edl_datamart.master_dpk_bsi
+WHERE batch_date = '2026-07-26' AND individu='C';
+
+
+/* ---------------------------------------------------------------------
+   STEP 2 : CLINICS THAT ARE BSI CUSTOMERS
+   Purpose : Match BSI customers against the Ministry of Health register of clinics (similarity score > 0.9).
+   Source  : da_wholesale_dpk_clean_pt, edl_external.satusehat_kemkes_healthcare_facilities_fasyankes
+   Result  : edl_sandbox.da_wholesale_satusehat_kemenkes_clean, edl_sandbox.hasil_similarity_klinik_puskemas
+   --------------------------------------------------------------------- */
+
+-- Cleaned facility names from the Ministry of Health (Kemenkes / SatuSehat) register, so that name variations can be matched
+-- drop table edl_sandbox.da_wholesale_satusehat_kemenkes_clean
+CREATE TABLE edl_sandbox.da_wholesale_satusehat_kemenkes_clean
+STORED AS PARQUET
+AS
+SELECT
+    namefacility,
+    UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(namefacility,'[^a-zA-Z0-9 ]',''),
+                        '\\s+',' '),
+                        '\\b(PT|CV|TBK|LTD)\\b',''),
+                        '(^| )(RS Umum Daerah|RS Umum|RS Ibu dan Anak|RS Gigi Dan Mulut|RS Jiwa|RS Angkatan Darat|RS Angkatan Laut|RS Angkatan Udara|RS Bedah|RS Daerah|RS Gigi Mulut|RS Ibu Anak|RS Islam|RS Khusus Bedah|
+                            RS Khusus Gigi dan Mulut|RS Khusus Ginjal|RS Khusus Ibu dan Anak|RS Khusus Mata|RS Gigi dan Mulut|RS Ibu Dan Anak|RS Jantung dan Pembuluh Darah|RS Jiwa Daerah|RS Khusus Daerah Gigi dan Mulut|
+                            RS Khusus Ibu Anak|RS Khusus Gigi dan Mulut|
+                            RSK BEDAH|RSPAD|RSKJKO|RSUDZA|RSUPN|RSIGM|RSKIA|RSPAU|RUMKITBAN|RUMKITAL|RSUD|RSUP|RSIA|RSAB|RSKO|RSPAL|RSGM|RSAU|RSPI|RSNU|RSPKU|RSJD|RSU|RSI|RSM|RSJ|RSB|RST|RSD|RSA|RS|BOKPKM|BOK PKM|)( |$)', ' '),
+                        '\\s+',' ')))
+        AS namefacility_clean,
+    districtdescription,
+    phone,
+    typefacility,
+    batch_date,
+    id
+FROM edl_external.satusehat_kemkes_healthcare_facilities_fasyankes
+WHERE batch_date = '2026-06-08'  -- scraping date of the Data Management (DM) team
+AND typefacility IN ('["Klinik"]');
+-- Other facility types available in the register (switch the filter above to use them):
+-- and typefacility in ('["Rumah Sakit"]', '["Klinik"]', '["Pusat Kesehatan Masyarakat"]', '["Apotek"]', '["Laboratorium Kesehatan"]');
+
+
+-- Clinics that are BSI customers: name similarity score > 0.9 between the deposit master and the Ministry of Health register
+-- drop table edl_sandbox.hasil_similarity_klinik_puskemas
+CREATE TABLE edl_sandbox.hasil_similarity_klinik_puskemas
+STORED AS PARQUET
+AS
+WITH base AS (
+    SELECT
+        s.namefacility AS nama_fasyankes_raw,
+        s.namefacility_clean AS nama_fasyankes,
+        s.districtdescription AS lokasi,
+        s.phone,
+        s.id,
+        REGEXP_REPLACE(s.typefacility, '[^a-zA-Z0-9 ]', '') AS jenis_faskes,
+        d.namacif AS namacif_dpk_raw,
+        d.namacif_clean AS namacif_dpk,
+        d.nocif AS nocif_dpk,
+        d.segmenbsi AS segmenbsi_dpk,
+
+        ROUND(1 - (
+            CAST(
+                LEVENSHTEIN(
+                    d.namacif_clean,
+                    s.namefacility_clean
+                ) AS DOUBLE
+            )
+            /
+            GREATEST(
+                LENGTH(d.namacif_clean),
+                LENGTH(s.namefacility_clean),
+                1
+            )
+        ),2) AS similarity_score
+
+    FROM edl_sandbox.da_wholesale_dpk_clean_pt AS d
+    JOIN edl_sandbox.da_wholesale_satusehat_kemenkes_clean AS s
+    ON ABS(LENGTH(d.namacif_clean) - LENGTH(s.namefacility_clean)) <=15  -- only compare names whose lengths differ by 15 characters or less (keeps the number of pairs manageable)
+    WHERE (
+        1 - (
+            CAST(
+                LEVENSHTEIN(
+                    d.namacif_clean,
+                    s.namefacility_clean
+                ) AS DOUBLE
+            )
+            /
+            GREATEST(
+                LENGTH(d.namacif_clean),
+                LENGTH(s.namefacility_clean),
+                1
+            )
+        ) > 0.9
+    )
+),
+
+-- List of facility IDs excluded after manual cleansing (false matches)
+list_exc AS (
+  SELECT *
+  FROM base
+  WHERE id IN (
+      '777', '1274', '1397', '1541', '1644', '1684', '1904', '2042',
+      '2076', '2257', '2276', '2302', '2615', '2661', '2688', '2719'
+  )
+),
+
+-- Final result with an exclusion flag (flag_exc = 1: the match was rejected after review)
+all_result_sim AS (
+  SELECT DISTINCT
+    b.*,
+    CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS flag_exc
+  FROM base b
+  LEFT JOIN list_exc e
+    ON b.id = e.id
+  ORDER BY b.similarity_score DESC, b.nama_fasyankes_raw
+)
+
+-- Clean similarity result for clinics (rejected matches removed)
+SELECT DISTINCT *
+FROM all_result_sim
+WHERE flag_exc = 0;
+
+-- Check: number of clinics / health centers that are BSI customers
+-- select jenis_faskes, count(distinct id)
+-- from edl_sandbox.hasil_similarity_klinik_puskemas
+-- group by 1
+-- order by 2 desc
+
+
+/* ---------------------------------------------------------------------
+   STEP 3 : COMMUNITY HEALTH CENTERS (PUSKESMAS) THAT ARE BSI CUSTOMERS
+   Purpose : Match BSI customers against the updated puskesmas register (similarity score > 0.9), then add the matches found manually.
+   Source  : edl_datamart.master_dpk_bsi (2026-08-30), whmart_list_puskesmas_update, whmart_puskesmas_bok_aceh
+   Result  : edl_sandbox.whmart_master_dpk_clean, edl_sandbox.whmart_list_puskesmas_update_clean,
+             edl_sandbox.hasil_similarity_puskemas_only_update   (the table name keeps the original spelling)
+   --------------------------------------------------------------------- */
+
+-- Cleaned customer names from the deposit (DPK) master, specific to community health centers (puskesmas)
+-- drop table edl_sandbox.whmart_master_dpk_clean
+CREATE TABLE edl_sandbox.whmart_master_dpk_clean
+STORED AS PARQUET
+AS
+SELECT DISTINCT
+    nocif,
+    namacif,
+        TRIM(UPPER(REGEXP_REPLACE(REGEXP_REPLACE(namacif,'[^a-zA-Z ]',''),
+      '(AHMAD HADIWIJAYA QQ PUSKESMAS|TIM DOTS  PUSKESMAS|BINROH AR RIDHA PUSKESMAS|LAB TBC UPTD PUSKESMAS|BENDAHARA PUSKESMAS|BLU PUSKESMAS|BLU UPT PUSKESMAS|BLUD PUSKESMAS|BLUD BPG PUSKESMAS|BOK PUSKESMAS|DANA SOSIAL PUSKESMAS|DPK PPNI PUSKESMAS|FKTP PUSKESMAS|IBI RANTING PUSKESMAS|JAMPERSAL PUSKESMAS|JKN PUSKESMAS|KEP PUSKESMAS|KLUB PROLANIS UPT PUSKESMAS|LAB PROG TB PUSKESMAS|LAB TBC UPTD PUSKESMAS|LAB TCM PUSKESMAS|LAB UPT PUSKESMAS|LAB UPTD PUSKESMAS|LABOR PUSKESMAS|LABORATORIUM PUSKESMAS|MARIYONO PUSKESMAS|PENANGANAN TKIB PUSKESMAS|PMT LOKAL UPTD PUSKESMAS|PPNI DPK UPTD PUSKESMAS|PROGRAM TB PUSKESMAS|PROLANIS PUSKESMAS|PROLANIS UPT PUSKESMAS|PROLANIS UPTD PUSKESMAS|PUJI LESTARI PUSKESMAS|PROLANSI PUSKESMAS|REK BAYAR UPTD PUSKESMAS|RETRIBUSI UPTD PUSKESMAS|TIM DOTS PUSKESMAS|UPT PUSKESMAS|UPTD PUSKESMAS|UPZ PUSKESMAS|RUANGAN KIA PUSKESMAS|SEHAT BERSAMA PUSKESMAS|SENAM SEGAR PUSKESMAS|TBC UPTD PUSKESMAS|TCM PUSKESMAS|TIM IPWL PUSKESMAS|PUSAT KESEHATAN MASYARAKAT|BOK PUKESMAS|JKN PUKESMAS|PPNI PUSKESMAS|PUSAT KESEHATAN MASYARKAT|BOKPUKESMAS|BOK PKM|BOKPKM|DANA KAPITASI JKN FKTP|DANA JKN FKTP|JKN FKTP|PUSKESMAS PERAWATAN|PUSKESMAS KOTA|LABORATORIUM PUKESMAS)',
+      'PUSKESMAS'
+        )))
+      AS namacif_clean,
+    segmenbsi,
+    kodebu,
+    batch_date
+FROM edl_datamart.master_dpk_bsi
+WHERE batch_date = '2026-08-30'
+  AND individu='C'
+  AND namacif NOT IN ('PUSAT KESEHATAN INTEGRATIF','AKSELERASI PUSKESMAS INDONESIA','NURHAFIZAH   PUSKESMAS SN','PROMOTIF DAN PREVENTIF PUSKESMAS','PROMOTIF PREVENTIF PUSKESMAS','KSM PUSKESMAS');
+
+-- Cleaned names from the updated puskesmas register (adds the word PUSKESMAS where missing)
+-- drop table edl_sandbox.whmart_list_puskesmas_update_clean
+CREATE TABLE edl_sandbox.whmart_list_puskesmas_update_clean
+STORED AS PARQUET
+AS
+SELECT
+    kode,
+    nama_puskesmas,
+      CASE WHEN nama_puskesmas LIKE '%PUSKESMAS%' THEN TRIM(UPPER(nama_puskesmas))
+            ELSE TRIM(UPPER(CONCAT('PUSKESMAS ', nama_puskesmas)))
+            END AS nama_puskesmas_clean,
+    alamat,
+    kecamatan,
+    kabupaten,
+    provinsi,
+    kemampuan_pelayanan,
+    karakteristik_wilayah_kerja
+FROM edl_sandbox.whmart_list_puskesmas_update
+-- where nama_puskesmas like '%PUSKESMAS%'
+;
+
+
+-- Puskesmas that are BSI customers (similarity score > 0.9)
+-- drop table edl_sandbox.hasil_similarity_puskesmas_only_update
+CREATE TABLE edl_sandbox.hasil_similarity_puskemas_only_update
+STORED AS PARQUET
+AS
+WITH base AS (
+    SELECT
+        puc.kode,
+        puc.nama_puskesmas AS nama_puskesmas_raw,
+        puc.nama_puskesmas_clean,
+        UPPER(puc.kabupaten) kabupaten,
+        UPPER(puc.provinsi) provinsi,
+        UPPER(puc.kemampuan_pelayanan) kemampuan_pelayanan,
+        d.namacif AS namacif_dpk_raw,
+        d.namacif_clean AS namacif_dpk,
+        d.nocif AS nocif_dpk,
+        d.segmenbsi AS segmenbsi_dpk,
+        ROUND(1 - (
+            CAST(
+                LEVENSHTEIN(
+                    d.namacif_clean,
+                    puc.nama_puskesmas_clean
+                ) AS DOUBLE
+            )
+            /
+            GREATEST(
+                LENGTH(d.namacif_clean),
+                LENGTH(puc.nama_puskesmas_clean),
+                1
+            )
+        ),2) AS similarity_score
+
+    FROM edl_sandbox.whmart_master_dpk_clean d
+    JOIN edl_sandbox.whmart_list_puskesmas_update_clean puc
+    ON ABS(LENGTH(d.namacif_clean) - LENGTH(puc.nama_puskesmas_clean)) <=15  -- only compare names whose lengths differ by 15 characters or less (keeps the number of pairs manageable)
+    WHERE (
+        1 - (
+            CAST(
+                LEVENSHTEIN(
+                    d.namacif_clean,
+                    puc.nama_puskesmas_clean
+                ) AS DOUBLE
+            )
+            /
+            GREATEST(
+                LENGTH(d.namacif_clean),
+                LENGTH(puc.nama_puskesmas_clean),
+                1
+            )
+        ) > 0.9
+    )
+),
+
+-- Customer numbers (nocif) excluded after cleansing because they are not the same entity
+list_exc AS(
+  SELECT nocif_dpk
+  FROM base
+  WHERE nocif_dpk IN (
+      '63226291', '89673316', '75099516', '89675902', '89678443', '83423543', '89676016', '89671629',
+      '64666166', '63226291', '75099516', '75099516', '61252991', '63226291', '64655658', '89678564',
+      '63226291', '53938777'
+  )
+),
+
+-- Exclude the customers in list_exc whose similarity score is below 1 (an exact match is always kept)
+temp_hasil AS (
+  SELECT b.*
+  FROM base b
+  LEFT JOIN list_exc le
+    ON b.nocif_dpk = le.nocif_dpk
+  WHERE NOT (
+    le.nocif_dpk IS NOT NULL
+    AND b.similarity_score <1)
+),
+
+-- Manually added matches: puskesmas whose names differ so much that the score is < 0.9,
+-- but which are confirmed BSI customers whose nocif does not appear in the similarity result
+list_added (kode, nocif) AS (
+  VALUES
+    ('1000121945','89672647'),
+    ('1000121775','89671457')
+),
+
+-- Manually added list, with extra information
+list_added_full AS (
+  SELECT
+    la.kode,
+    lpu.nama_puskesmas AS nama_puskesmas_raw,
+    CONCAT('PUSKESMAS ', lpu.nama_puskesmas) AS nama_puskesmas_clean,
+    lpu.kabupaten,
+    lpu.provinsi,
+    lpu.kemampuan_pelayanan,
+    d.namacif AS nama_dpk_raw,
+    pba.nama_nasabah AS namacif_clean,
+    d.nocif AS nocif_dpk,
+    d.segmenbsi AS segmenbsi_dpk,
+    1 AS similarity_score
+  FROM list_added la
+  LEFT JOIN edl_sandbox.whmart_list_puskesmas_update lpu
+    ON la.kode = lpu.kode
+  LEFT JOIN (SELECT DISTINCT nocif, namacif, segmenbsi FROM edl_datamart.master_dpk_bsi WHERE batch_date ='2026-08-30') d
+    ON la.nocif = d.nocif
+  LEFT JOIN edl_sandbox.whmart_puskesmas_bok_aceh pba
+    ON d.nocif = pba.nocif
+)
+
+SELECT *
+FROM temp_hasil
+UNION
+SELECT *
+FROM list_added_full;
+
+
+/* ---------------------------------------------------------------------
+   STEP 4 : HOSPITALS THAT ARE BSI CUSTOMERS
+   Purpose : Match BSI customers against the Ministry of Health hospital register (similarity score > 0.95).
+   Source  : da_wholesale_dpk_clean_pt, edl_external.sirs_kemkes_hospital_summary
+   Result  : edl_sandbox.sirs_kemkes_hospital_clean, edl_sandbox.hasil_similarity_rumahsakit
+   --------------------------------------------------------------------- */
+
+-- Cleaned hospital names from the Ministry of Health hospital register (SIRS Kemkes), with a hospital category.
+-- NOTE: the filter  UPPER(nama) RLIKE 'AVICENNA'  below looks like a leftover from testing: it limits this
+-- table to hospitals with AVICENNA in the name. Remove it to cover all hospitals.
+-- drop table edl_sandbox.sirs_kemkes_hospital_clean
+CREATE TABLE edl_sandbox.sirs_kemkes_hospital_clean
+STORED AS PARQUET
+AS
+SELECT
+  kode AS kode_rs,
+  nama AS nama_rs,
+  UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(UPPER(nama),'[^a-zA-Z0-9 ]',''),
+              '\\s+',' '),
+              '\\b(PT|CV|TBK|LTD)\\b',''),
+              '(^| )(RS UMUM DAERAH|RS UMUM|RS IBU DAN ANAK|RS GIGI DAN MULUT|RS JIWA|RS ANGKATAN DARAT|RS ANGKATAN LAUT|RS ANGKATAN UDARA|RS BEDAH|RS DAERAH|RS GIGI MULUT|RS IBU ANAK|RS ISLAM|RS KHUSUS BEDAH|
+                RS KHUSUS GIGI DAN MULUT|RS KHUSUS GINJAL|RS KHUSUS IBU DAN ANAK|RS KHUSUS MATA|RS GIGI DAN MULUT|RS IBU DAN ANAK|RS JANTUNG DAN PEMBULUH DARAH|RS JIWA DAERAH|RS KHUSUS DAERAH GIGI DAN MULUT|
+                RS KHUSUS IBU ANAK|RS KHUSUS GIGI DAN MULUT|
+                RSK BEDAH|RSPAD|RSKJKO|RSUDZA|RSUPN|RSIGM|RSKIA|RSPAU|RUMKITBAN|RUMKITAL|RSUD|RSUP|RSIA|RSAB|RSKO|RSPAL|RSGM|RSAU|RSPI|RSNU|RSPKU|RSJD|RSU|RSI|RSM|RSJ|RSB|RST|RSD|RSA|RS|BOKPKM|BOK PKM|)( |$)', ' '),
+              '\\s+',' ')))
+    AS nama_rs_clean,
+  nama_prop AS prov,
+  kab AS kabkota,
+  pemilik,
+  kelas,
+  jenis_rs,
+  direktur,
+  CASE
+      WHEN UPPER(pemilik)= 'ORGANISASI ISLAM' THEN 'EKOSISTEM ISLAM'
+      WHEN UPPER(nama) RLIKE 'MUHAMMADIYAH|ISLAM|RSI ' THEN 'EKOSISTEM ISLAM'
+      WHEN UPPER(pemilik) RLIKE 'PEMPROP|PEMKAB|PEMKOT' THEN 'PEMERINTAH DAERAH'
+      WHEN UPPER(pemilik) RLIKE 'TNI |KEMKES|POLRI|KEMENTERIAN' THEN 'PEMERINTAH PUSAT'
+      WHEN UPPER(pemilik) RLIKE 'SWASTA|PERUSAHAAN|PERORANGAN|BUMN' THEN 'SWASTA & BUMN'
+      WHEN UPPER(pemilik) RLIKE 'HINDU|BUDHA|KATHOLIK|PROTESTAN|SOSIAL' THEN 'ORGANISASI SOSIAL/KEAGAMAAN LAINNYA'
+    END AS kategori_rs
+FROM edl_external.sirs_kemkes_hospital_summary
+WHERE UPPER(nama) RLIKE 'AVICENNA';
+
+
+-- Hospitals that are BSI customers (similarity score > 0.95, stricter than the other steps)
+-- drop table edl_sandbox.hasil_similarity_rumahsakit
+CREATE TABLE edl_sandbox.hasil_similarity_rumahsakit
+STORED AS PARQUET
+AS
+WITH base AS (
+  SELECT
+      s.kode_rs,
+      s.nama_rs AS nama_rs_raw,
+      s.nama_rs_clean AS nama_rs_clean,
+      s.kategori_rs AS kategori_rs,
+      d.namacif AS namacif_dpk_raw,
+      d.namacif_clean AS namacif_dpk,
+      d.nocif AS nocif_dpk,
+      d.segmenbsi AS segmenbsi_dpk,
+
+      ROUND(1 - (
+          CAST(
+              LEVENSHTEIN(
+                  d.namacif_clean,
+                  s.nama_rs_clean
+              ) AS DOUBLE
+          )
+          /
+          GREATEST(
+              LENGTH(d.namacif_clean),
+              LENGTH(s.nama_rs_clean),
+              1
+          )
+      ),2) AS similarity_score
+
+  FROM edl_sandbox.da_wholesale_dpk_clean_pt AS d
+  JOIN edl_sandbox.sirs_kemkes_hospital_clean AS s
+  ON ABS(LENGTH(d.namacif_clean) - LENGTH(s.nama_rs_clean)) <=15  -- only compare names whose lengths differ by 15 characters or less (keeps the number of pairs manageable)
+  WHERE (
+      1 - (
+          CAST(
+              LEVENSHTEIN(
+                  d.namacif_clean,
+                  s.nama_rs_clean
+              ) AS DOUBLE
+          )
+          /
+          GREATEST(
+              LENGTH(d.namacif_clean),
+              LENGTH(s.nama_rs_clean),
+              1
+          )
+      ) > 0.95
+  )
+),
+
+-- Customer names excluded after cleansing (generic names that match many hospitals by mistake)
+list_exc AS (
+  SELECT *
+  FROM base
+  WHERE namacif_dpk_raw IN (
+      'ACEH', 'ADI GUNA CV', 'AISYIYAH', 'AL  HASANAH', 'AL CHASANAH', 'AL FATAH', 'AL HASANAH', 'AL HUDA',
+      'AL ISLAM', 'ALIYAH', 'AMAL SEHAT', 'AMALIA MEDIKA', 'AMANAH', 'AMANAH CV', 'AMANAT', 'AMANDA',
+      'AMANNA', 'AMINAH', 'AN NIMAH', 'ANANDA CV', 'ANDHIKA CV'
+  )
+),
+
+-- Final result with an exclusion flag
+all_result_sim AS (
+  SELECT DISTINCT
+    b.*,
+    CASE WHEN e.namacif_dpk_raw IS NOT NULL THEN 1 ELSE 0 END AS flag_exc
+  FROM base b
+  LEFT JOIN list_exc e
+    ON e.namacif_dpk_raw = b.namacif_dpk_raw
+  ORDER BY b.similarity_score DESC, b.nama_rs_raw
+)
+
+-- Clean similarity result for hospitals (rejected matches removed)
+SELECT *
+FROM all_result_sim
+WHERE flag_exc = 0;
+
+-- Check: number of hospitals that are BSI customers
+-- select count(distinct kode_rs)
+-- from edl_sandbox.hasil_similarity_rumahsakit
+
+
+/* ---------------------------------------------------------------------
+   STEP 5 : INSURANCE COMPANIES THAT ARE BSI CUSTOMERS
+   Purpose : Match BSI customers against the full list of insurance companies in Indonesia (similarity score > 0.9).
+   Source  : edl_datamart.master_dpk_bsi (2026-07-26), edl_sandbox.da_wholesale_base_asuransi_full
+   Result  : edl_sandbox.hasil_similarity_asuransi
+   --------------------------------------------------------------------- */
+
+-- Reference table: full information on all insurance companies in Indonesia
+-- select *
+-- from edl_sandbox.da_wholesale_base_asuransi_full
+
+-- drop table edl_sandbox.hasil_similarity_asuransi
+CREATE TABLE edl_sandbox.hasil_similarity_asuransi
+STORED AS PARQUET
+AS
+-- Cleaned customer names from the deposit (DPK) master
+WITH base_dpk AS (
+    SELECT
+        nocif,
+        namacif,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(namacif,'[^a-zA-Z0-9 ]',''),
+                                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                                        '\\s+',' ')))
+               AS namacif_clean,
+        segmenbsi,
+        kodebu,
+        jenisproduk,
+        batch_date
+    FROM edl_datamart.master_dpk_bsi
+    WHERE batch_date = '2026-07-26' AND individu='C'
+),
+
+-- Find the insurance companies that are already BSI customers
+hasil AS(
+    SELECT
+        UPPER(a.nama_perusahaan_clean) AS nama_asuransi,
+        d.nocif AS nocif_dpk,
+        d.namacif AS namacif_dpk,
+        d.namacif_clean AS namacif_clean_dpk,
+        d.segmenbsi AS segmenbsi_dpk,
+
+        ROUND(1 - (
+            CAST(
+                LEVENSHTEIN(
+                    d.namacif_clean,
+                    UPPER(a.nama_perusahaan_clean)
+                ) AS DOUBLE
+            )
+            /
+            GREATEST(
+                LENGTH(d.namacif_clean),
+                LENGTH(UPPER(a.nama_perusahaan_clean)),
+                1
+            )
+        ),2) AS similarity_score
+
+    FROM edl_sandbox.da_wholesale_base_asuransi_full a  -- complete list of insurance companies in Indonesia
+    JOIN base_dpk d
+    ON ABS(LENGTH(d.namacif_clean) - LENGTH(UPPER(a.nama_perusahaan_clean))) <=15
+    WHERE (
+        1 - (
+            CAST(
+                LEVENSHTEIN(
+                    d.namacif_clean,
+                    UPPER(a.nama_perusahaan_clean)
+                ) AS DOUBLE
+            )
+            /
+            GREATEST(
+                LENGTH(d.namacif_clean),
+                LENGTH(UPPER(a.nama_perusahaan_clean)),
+                1
+            )
+        ) > 0.9
+    )
+)
+
+SELECT DISTINCT *
+FROM hasil
+WHERE nama_asuransi NOT IN ('BPJS KESEHATAN','AIG INSURANCE INDONESIA')  -- exclusion list
+ORDER BY similarity_score DESC, nama_asuransi;
+
+-- Check: number of insurance companies that are BSI customers
+-- select count(distinct nama_asuransi)
+-- from edl_sandbox.hasil_similarity_asuransi
+
+
+/* ---------------------------------------------------------------------
+   STEP 6 : PAYROLL CUSTOMERS - FACILITY VIEW
+   Purpose : Find which facilities that pay their staff through BSI payroll are already BSI customers:
+             first by exact name, then by name similarity (score > 0.9).
+   Source  : edl_datamart.master_payroll_phr_kolaborasi (2026-06-30, hospital segment), edl_datamart.master_dpk_bsi
+   Result  : edl_sandbox.hasil_similarity_payroll_pov_faskes
+   --------------------------------------------------------------------- */
+
+-- BSI SHARE OF HEALTHCARE-WORKER PAYROLL (FACILITY VIEW)
+-- List of all payroll-customer facilities (hospital segment)
+CREATE TABLE edl_sandbox.hasil_similarity_payroll_pov_faskes
+STORED AS PARQUET
+AS
+WITH base_payroll AS (
+  SELECT
+    instansifinal AS instansi_raw,
+    UPPER(TRIM(instansifinal)) AS instansi_upper
+  FROM edl_datamart.master_payroll_phr_kolaborasi
+  WHERE batch_date = '2026-06-30'
+    AND categorysegmen = 'RS'
+),
+
+-- Payroll customers whose name is exactly the same as a customer name in the deposit master
+-- (reduces the number of names that need similarity matching)
+cek AS(
+  SELECT
+    d.nocif AS nocif,
+    d.segmenbsi AS segmenbsi_dpk,
+    UPPER(d.namacif) AS namacif_dpk,
+    bp.instansi_upper AS instansi_raw
+  FROM base_payroll bp
+  LEFT JOIN (SELECT DISTINCT nocif, namacif, segmenbsi FROM edl_datamart.master_dpk_bsi WHERE batch_date='2026-08-04' AND individu='C') d
+  ON bp.instansi_upper = d.namacif
+),
+
+-- ===== RESULT 1: payroll customers matched by exact name =====
+hasil_nama_persis AS(
+  SELECT DISTINCT
+    c.instansi_raw,
+    UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(c.instansi_raw),'[^a-zA-Z0-9 ]',''),
+                    '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                        '\\s+',' '))) AS instansi_clean,
+    c.nocif AS nocif_dpk,
+    c.namacif_dpk AS namacif_dpk,
+    UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(c.namacif_dpk),'[^a-zA-Z0-9 ]',''),
+                    '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                        '\\s+',' '))) AS namacif_clean_dpk,
+    c.segmenbsi_dpk,
+    1 AS similarity_score,
+    0 AS flag_exc
+  FROM cek c
+  WHERE c.nocif IS NOT NULL
+),
+
+-- Clean the facility names that were NOT found in the deposit master, so that similarity matching can be run on them
+temp_payroll_undef AS (
+  SELECT DISTINCT
+    instansi_raw,
+    TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(instansi_raw)), '[^a-zA-Z0-9 ]', ''),
+          '(^| )(PT|CV|TBK|LTD|RUMAH SAKIT UMUM DAERAH|RUMAH SAKIT UMUM|RUMAH SAKIT IBU DAN ANAK|RUMAH SAKIT GIGI DAN MULUT|RUMAH SAKIT JIWA|RUMAH SAKIT ANGKATAN DARAT|RUMAH SAKIT ANGKATAN LAUT|RUMAH SAKIT ANGKATAN UDARA|RUMAH SAKIT BEDAH|RUMAH SAKIT DAERAH|RUMAH SAKIT KHUSUS BEDAH|RUMAH SAKIT KHUSUS GIGI DAN MULUT|RUMAH SAKIT KHUSUS GINJAL|RUMAH SAKIT KHUSUS IBU DAN ANAK|RUMAH SAKIT KHUSUS MATA|RUMAH SAKIT JANTUNG DAN PEMBULUH DARAH|RUMAH SAKIT JIWA DAERAH|RUMAH SAKIT KHUSUS DAERAH GIGI DAN MULUT|RUMAH SAKIT KHUSUS IBU ANAK|RUMAH SAKIT|RS UMUM DAERAH|RS UMUM|RS IBU DAN ANAK|RS GIGI DAN MULUT|RS JIWA|RS ANGKATAN DARAT|RS ANGKATAN LAUT|RS ANGKATAN UDARA|RS BEDAH|RS DAERAH|RS GIGI MULUT|RS IBU ANAK|RS ISLAM|RS KHUSUS BEDAH|RS KHUSUS GIGI DAN MULUT|RS KHUSUS GINJAL|RS KHUSUS IBU DAN ANAK|RS KHUSUS MATA|RS JANTUNG DAN PEMBULUH DARAH|RS JIWA DAERAH|RS KHUSUS DAERAH GIGI DAN MULUT|RS KHUSUS IBU ANAK|RSK BEDAH|RSPAD|RSKJKO|RSUDZA|RSUPN|RSIGM|RSKIA|RSPAU|RUMKITBAN|RUMKITAL|RSUD|RSUP|RSIA|RSAB|RSKO|RSPAL|RSGM|RSAU|RSPI|RSNU|RSPKU|RSJD|RSU|RSI|RSM|RSJ|RSB|RST|RSD|RSA|RS|BOKPKM|BOK PKM)( |$)', ' '), '\\s+', ' ')) AS instansi_clean
+  FROM cek c
+  WHERE c.nocif IS NULL
+),
+
+-- Clean the deposit-master names for comparison
+base_dpk AS (
+  SELECT
+    nocif,
+    namacif,
+    UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(namacif, '[^a-zA-Z0-9 ]', ''), '(^| )(PT|CV|TBK|LTD)( |$)', ''), '\\s+', ' '))) AS namacif_clean,
+    segmenbsi,
+    kodebu,
+    jenisproduk,
+    batch_date
+  FROM edl_datamart.master_dpk_bsi
+  WHERE batch_date = '2026-07-26'
+    AND individu = 'C'
+),
+
+-- Compute the similarity score to see which facilities are already BSI customers
+hasil AS (
+  SELECT
+    p.instansi_raw,
+    p.instansi_clean,
+    d.nocif AS nocif_dpk,
+    d.namacif AS namacif_dpk,
+    d.namacif_clean AS namacif_clean_dpk,
+    d.segmenbsi AS segmenbsi_dpk,
+    ROUND(
+      1 - (
+        CAST(LEVENSHTEIN(d.namacif_clean, p.instansi_clean) AS DOUBLE)
+        /
+        GREATEST(LENGTH(d.namacif_clean), LENGTH(p.instansi_clean), 1)
+      ), 2
+    ) AS similarity_score
+  FROM temp_payroll_undef p
+  JOIN base_dpk d
+    ON ABS(LENGTH(d.namacif_clean) - LENGTH(p.instansi_clean)) <= 15
+    AND p.instansi_clean <> ''
+  WHERE (
+    1 - (
+      CAST(LEVENSHTEIN(d.namacif_clean, p.instansi_clean) AS DOUBLE)
+      /
+      GREATEST(LENGTH(d.namacif_clean), LENGTH(p.instansi_clean), 1)
+    )
+  ) > 0.9
+),
+
+-- Customer numbers excluded after cleansing
+list_exc AS(
+  SELECT nocif_dpk
+  FROM hasil
+  WHERE nocif_dpk IN (
+      '50064782', '50184635', '50286756', '50338729', '50470761', '50809160', '51565646', '51896553',
+      '51941436', '52194634', '53003113', '53055082', '53897087', '53995674', '54351044', '54485177',
+      '54515649', '60054269', '60275656', '60515127', '60573014', '60951212', '61012705', '61149121',
+      '61298172', '61512614', '61522926', '61661843', '61948809', '62365009', '62462160', '62725278',
+      '62869272', '62888960', '63087381', '63113728'
+  )
+),
+
+-- Final similarity result with an exclusion flag
+all_hasil_sim AS (
+  SELECT DISTINCT
+    h.*,
+    CASE WHEN e.nocif_dpk IS NOT NULL THEN 1 ELSE 0 END AS flag_exc
+  FROM hasil h
+  LEFT JOIN list_exc e
+  ON h.nocif_dpk = e.nocif_dpk
+),
+
+-- ===== RESULT 2: similarity matches (to be combined with the exact-name matches) =====
+hasil_similarity AS(
+  SELECT DISTINCT *
+  FROM all_hasil_sim
+  WHERE flag_exc=0
+)
+
+-- Final result
+SELECT *
+FROM hasil_nama_persis
+UNION
+SELECT *
+FROM hasil_similarity;
+
+-- Check: number of payroll facilities (facility view)
+-- select count(distinct instansi_raw)
+-- from edl_sandbox.hasil_similarity_payroll_pov_faskes
+
+
+/* ---------------------------------------------------------------------
+   STEP 7 : PAYROLL CUSTOMERS - EMPLOYEE VIEW (HEALTHCARE WORKERS)
+   Purpose : List the payroll recipients that are healthcare workers (nakes), based on the occupation recorded for each employee.
+   Source  : edl_datamart.master_payroll_phr_kolaborasi (2026-06-30, hospital segment)
+   Result  : edl_sandbox.hasil_similarity_payroll_pov_pegawai
+   --------------------------------------------------------------------- */
+
+-- BSI SHARE OF HEALTHCARE-WORKER PAYROLL (EMPLOYEE VIEW)
+-- drop table edl_sandbox.hasil_similarity_payroll_pov_pegawai
+CREATE TABLE edl_sandbox.hasil_similarity_payroll_pov_pegawai
+STORED AS PARQUET
+AS
+WITH temp_payroll AS(
+    SELECT
+        nocif,
+        nociflegacy,
+        norekeningpayroll,
+        instansifinal,
+        nominalpayroll,
+        namacif,
+        occupation,
+        categorysegmen
+    FROM edl_datamart.master_payroll_phr_kolaborasi
+    WHERE categorysegmen ='RS'
+        AND batch_date='2026-06-30'
+),
+
+-- Classify which employees are healthcare workers (nakes), based on their occupation
+list_nakes AS(
+  SELECT *
+  FROM edl_datamart.master_payroll_phr_kolaborasi
+    WHERE categorysegmen ='RS'
+        AND batch_date='2026-06-30'
+        AND occupation IN ( select distinct occupation from edl_sandbox.list_occupation
+        )
+),
+
+-- Final CTE: adds flag_nakes (Y = the employee is a healthcare worker, N = not)
+flag_nakes AS (
+  SELECT
+    tp.*,
+    CASE WHEN nk.occupation IS NOT NULL THEN 'Y' ELSE 'N' END AS flag_nakes
+    FROM temp_payroll tp
+    LEFT JOIN list_nakes nk
+      ON tp.occupation = nk.occupation
+)
+
+SELECT DISTINCT *
+FROM flag_nakes
+WHERE flag_nakes ='Y';
+
+-- Check: number of payroll employees who are healthcare workers
+-- select count(distinct nocif)
+-- from edl_sandbox.hasil_similarity_payroll_pov_pegawai
+
+
+/* ---------------------------------------------------------------------
+   STEP 8 : PHARMACIES AND PHARMACEUTICAL COMPANIES THAT ARE BSI CUSTOMERS
+   Purpose : Match BSI customers against the lists of pharmaceutical companies and pharmacies (similarity score > 0.9);
+             wrong matches and pharmacies owned by healthcare facilities are excluded.
+   Source  : da_wholesale_dpk_clean_pt, da_wholesale_base_farmasi, da_wholesale_base_apotek_full
+   Result  : edl_sandbox.da_wholesale_list_farmasi_apotek_clean, edl_sandbox.hasil_similarity_farmasi_apotek
+   --------------------------------------------------------------------- */
+
+-- Combine the list of pharmaceutical companies (farmasi) and the list of pharmacies (apotek) into one table
+CREATE TABLE edl_sandbox.da_wholesale_list_farmasi_apotek_clean
+STORED AS PARQUET
+AS
+WITH base_farmasi_apotek AS(
+    SELECT nama
+    FROM edl_sandbox.da_wholesale_base_farmasi  -- complete list of pharmaceutical companies in Indonesia
+    UNION ALL
+    SELECT nama_apotek
+    FROM edl_sandbox.da_wholesale_base_apotek_full  -- complete list of pharmacies in Indonesia
+),
+
+-- Clean the name variations of pharmacies / pharmaceutical companies
+temp_farmasi_apotek AS (
+  SELECT DISTINCT
+    nama AS nama_raw,
+    TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(nama)),
+          '[^a-zA-Z0-9 ]', ''),
+          '(^| )(INSTALASI FARMASI|RUANG FARMASI|INST.FARM|INST.FAR|RUMKITBAN|RUMKITAL|IFRSGMP|IFRSIA|IFRSUD|IFRSUP|IFKURJ|IFRSAL|IFRSAU|IFRSGM|RSKJKO|RSUDZA|RSUPN|RSPAD|IFKU|IFRS|INSFAR|IFRS RSIA|IFRS RSUD|IFRS RSU|IFRS RS|IF RSIY|IF RSKIA|IF RSUP|IF RSJ|IF RSJD|IF RSKB|IF RSK|IF RSAB|IF RSAU|IF RSAD|IF RSAL|IF RSAU|IF RSD|IF RSI|IF RSIA|IF RSUD|IF RSU|IFRSU|IFRSKIA|RSIGM|RSKIA|RSPAU|RSPKU|RSPAL|RSGM|RSAB|RSAU|RSPI|RSNU|RSJD|RSKO|RSUP|RSUD|RSIA|RSAU|RSU|RSI|RSM|RSJ|RSB|RST|RSD|RSA|BOKPKM|BOK PKM|INST|INSFAR|INF|INS|IF RS|IFRS|IF|PT|CV|TBK|LTD|RS)( |$)',' '),
+          '\s+', ' ')) AS nama_clean
+          FROM base_farmasi_apotek
+)
+
+SELECT *
+FROM temp_farmasi_apotek;
+
+
+-- Pharmacies / pharmaceutical companies that are BSI customers (similarity score > 0.9)
+CREATE TABLE edl_sandbox.hasil_similarity_farmasi_apotek
+STORED AS PARQUET
+AS
+WITH hasil AS (
+  SELECT
+    f.nama_raw,
+    f.nama_clean,
+    d.nocif AS nocif_dpk,
+    d.namacif AS namacif_dpk,
+    d.namacif_clean AS namacif_clean_dpk,
+    d.segmenbsi AS segmenbsi_dpk,
+    ROUND(
+      1 - (
+        CAST(LEVENSHTEIN(d.namacif_clean, f.nama_clean) AS DOUBLE)
+        /
+        GREATEST(LENGTH(d.namacif_clean), LENGTH(f.nama_clean), 1)
+      ), 2
+    ) AS similarity_score
+  FROM edl_sandbox.da_wholesale_list_farmasi_apotek_clean f
+  JOIN edl_sandbox.da_wholesale_dpk_clean_pt d
+    ON ABS(LENGTH(d.namacif_clean) - LENGTH(f.nama_clean)) <= 15
+    AND f.nama_clean <> ''
+  WHERE (
+    1 - (
+      CAST(LEVENSHTEIN(d.namacif_clean, f.nama_clean) AS DOUBLE)
+      /
+      GREATEST(LENGTH(d.namacif_clean), LENGTH(f.nama_clean), 1)
+    )
+  ) > 0.9
+),
+
+-- Customer numbers excluded after cleansing
+list_exc AS (
+  SELECT *
+  FROM hasil
+  WHERE nocif_dpk IN (
+      '84426600', '75088405', '78948092', '96472235', '75081477', '96511414', '50470761', '75097533',
+      '81901696', '92951345', '86224158', '96723840', '91963563', '98040153', '94727160', '92930946',
+      '86239902', '64716888', '88065915', '87726393', '87728829', '92265182', '75087603', '77622854',
+      '80485776', '63379525', '61230900', '63295109', '79796972', '85403284', '54456750', '94795767',
+      '89732014', '87674038', '77524227', '82217184', '91237160', '94893481', '90823403', '90734404',
+      '86519914', '97554302', '75214880'
+  )
+),
+
+-- Customer numbers that are pharmacies owned by healthcare facilities (not independent pharmacies)
+list_fasilitas_faskes AS (
+  SELECT *
+  FROM hasil
+  WHERE nocif_dpk IN (
+      '82686083', '77173673', '90253212', '83737185', '81235221', '62611840', '63346776', '94128481',
+      '88980290', '83894813', '84248356', '61397201', '90266538', '83281378', '63829680', '92082926',
+      '89054464', '89584322', '78763547', '82316488', '76730515', '63513157', '93459910', '94554607',
+      '80730099', '94719918', '85519100', '89184647', '62923866', '75076804'
+  )
+),
+
+-- Final CTE: adds the exclusion flag and the facility-owned flag
+add_flag AS (
+  SELECT
+    h.*,
+    CASE WHEN le.nocif_dpk IS NOT NULL THEN 1 ELSE 0 END AS flag_exc,
+    CASE WHEN ff.nocif_dpk IS NOT NULL THEN 1 ELSE 0 END AS flag_fasilitas_faskes
+  FROM hasil h
+  LEFT JOIN list_exc le
+    ON h.nocif_dpk = le.nocif_dpk
+  LEFT JOIN list_fasilitas_faskes ff
+    ON h.nocif_dpk = ff.nocif_dpk
+)
+
+-- Keep the pharmacies / pharmaceutical companies that are BSI customers
+SELECT DISTINCT *
+FROM add_flag
+WHERE flag_exc = 0 AND flag_fasilitas_faskes= 0  -- drop wrong matches and pharmacies owned by healthcare facilities
+ORDER BY similarity_score DESC, nama_raw;
+
+-- Check: number of pharmacy / pharmaceutical customers
+-- select count(distinct nama_raw)
+-- from edl_sandbox.hasil_similarity_farmasi_apotek
+
+
+/* ---------------------------------------------------------------------
+   STEP 9 : MEDICAL-DEVICE (ALKES) COMPANIES THAT ARE BSI CUSTOMERS
+   Purpose : Match BSI customers against the Ministry of Health registry of domestic medical-device licences (similarity score > 0.9).
+   Source  : da_wholesale_dpk_clean_pt, edl_external.infoalkes_kemkes_rekapitulasi_izin_edar_alkes_dalam_negeri
+   Result  : edl_sandbox.da_wholesale_alkes_clean, edl_sandbox.hasil_similarity_alkes
+   --------------------------------------------------------------------- */
+
+-- Cleaned names of medical-device (alkes) companies, from the Ministry of Health registry of domestic device licences
+-- drop table edl_sandbox.da_wholesale_alkes_clean
+CREATE TABLE edl_sandbox.da_wholesale_alkes_clean
+STORED AS PARQUET
+AS
+WITH base_alkes AS(
+    SELECT
+        pendaftar AS nama_alkes,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(pendaftar,'[^a-zA-Z0-9 ]',''),
+                        '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                                '\\s+',' ')))
+            AS nama_alkes_clean,
+        alamat_pendaftar AS alamat_alkes,
+        batch_date
+    FROM edl_external.infoalkes_kemkes_rekapitulasi_izin_edar_alkes_dalam_negeri
+)
+
+SELECT DISTINCT *
+FROM base_alkes;
+
+
+-- Medical-device companies that are BSI customers (similarity score > 0.9)
+CREATE TABLE edl_sandbox.hasil_similarity_alkes
+STORED AS PARQUET
+AS
+WITH hasil AS(
+    SELECT
+        a.nama_alkes,
+        a.nama_alkes_clean AS nama_alkes_clean,
+        d.nocif AS nocif_dpk,
+        d.namacif AS namacif_dpk,
+        d.namacif_clean AS namacif_clean_dpk,
+        d.segmenbsi AS segmenbsi_dpk,
+
+        ROUND(1 - (
+            CAST(
+                LEVENSHTEIN(
+                    d.namacif_clean,
+                    a.nama_alkes_clean
+                ) AS DOUBLE
+            )
+            /
+            GREATEST(
+                LENGTH(d.namacif_clean),
+                LENGTH(a.nama_alkes_clean),
+                1
+            )
+        ),2) AS similarity_score
+
+    FROM edl_sandbox.da_wholesale_alkes_clean a
+    JOIN edl_sandbox.da_wholesale_dpk_clean_pt d
+    ON ABS(LENGTH(d.namacif_clean) - LENGTH(a.nama_alkes_clean)) <=15
+    WHERE (
+        1 - (
+            CAST(
+                LEVENSHTEIN(
+                    d.namacif_clean,
+                    a.nama_alkes_clean
+                ) AS DOUBLE
+            )
+            /
+            GREATEST(
+                LENGTH(d.namacif_clean),
+                LENGTH(a.nama_alkes_clean),
+                1
+            )
+        ) > 0.9
+    )
+),
+
+-- Customer numbers excluded after cleansing
+list_exc AS (
+  SELECT *
+  FROM hasil
+  WHERE nocif_dpk IN (
+      '63856526', '63879316', '64177356', '75080931', '82481380', '86887696', '87519145', '88373903',
+      '88877505', '88960337', '89125526', '91256771', '92378436', '92994187', '93227749', '93693209',
+      '93836666', '94014053', '94783091', '94991913', '95412381', '95485682', '96565413', '97692528',
+      '97849882', '98219784'
+  )
+),
+
+-- Final result with an exclusion flag
+all_hasil_sim AS (
+  SELECT DISTINCT
+    h.*,
+    CASE WHEN e.nocif_dpk IS NOT NULL THEN 1 ELSE 0 END AS flag_exc
+  FROM hasil h
+  LEFT JOIN list_exc e
+    ON h.nocif_dpk = e.nocif_dpk
+)
+
+-- Medical-device companies that are BSI customers, after similarity matching and cleansing
+SELECT DISTINCT *
+FROM all_hasil_sim
+WHERE flag_exc = 0;
+
+-- Check: number of medical-device customers
+-- select count(distinct nama_alkes)
+-- from edl_sandbox.hasil_similarity_alkes
+
+
+/* =====================================================================
+   PART 2 - MONEY FLOWS INSIDE THE HEALTHCARE ECOSYSTEM
+   ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   STEP 10 : SHARED LOOKUP - UNIVERSE OF HEALTHCARE-FACILITY NAMES
+   Purpose : Build the list of all clinics, puskesmas and hospitals in Indonesia (BSI customers and non-customers),
+             so that transactions to / from them can be found in any bank. Built once and reused by Steps 14 to 19.
+   Source  : Step 2, 3 and 4 results, edl_datamart.master_dpk_bsi (2026-08-31), SatuSehat and SIRS Kemenkes registers, whmart_list_puskesmas_update
+   Result  : edl_sandbox.da_wholesale_nama_universe_faskes_clean
+   --------------------------------------------------------------------- */
+
+-- Universe of healthcare-facility names, built once and reused by Steps 14 to 19 (makes the queries more efficient)
+-- drop table edl_sandbox.da_wholesale_nama_universe_faskes_clean
+CREATE TABLE edl_sandbox.da_wholesale_nama_universe_faskes_clean
+STORED AS PARQUET
+AS
+-- Clinics and puskesmas that are BSI customers (similarity > 90%)
+WITH klinik_puskesmas AS (
+  SELECT DISTINCT nocif_dpk AS nocif
+  FROM edl_sandbox.hasil_similarity_klinik_puskemas  -- clinics only
+  WHERE jenis_faskes= 'Klinik'
+
+  UNION
+
+  SELECT DISTINCT nocif_dpk AS nocif
+  FROM edl_sandbox.hasil_similarity_puskemas_only_update  -- puskesmas only
+),
+
+-- Union of clinic / puskesmas customers and hospital customers = all facility customers
+all_faskes AS (
+  SELECT nocif AS nocif_faskes
+  FROM klinik_puskesmas  -- clinic and puskesmas customers
+  UNION
+  SELECT nocif_dpk AS nocif_faskes
+  FROM edl_sandbox.hasil_similarity_rumahsakit  -- hospital customers
+),
+
+-- Identity details (account number, name) of all facility customers, from the deposit master
+all_nasabah_faskes AS(
+    SELECT DISTINCT
+        f.nocif_faskes AS nocif_faskes,
+        d.norekening AS norek_faskes,
+        d.namacif AS nama_faskes,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(d.namacif,'[^a-zA-Z0-9 ]',' '),
+          '(^| )(PT|CV|TBK|LTD)( |$)',' '),
+          '\\s+',' ')))
+    AS nama_faskes_clean
+    FROM all_faskes f
+    LEFT JOIN edl_datamart.master_dpk_bsi d
+        ON f.nocif_faskes = d.nocif
+    WHERE d.batch_date ='2026-08-31'
+        AND d.individu='C'
+),
+
+-- All clinic names in Indonesia, cleaned (source: SatuSehat Kemenkes)
+list_klinik_all AS(  -- clinics, all of Indonesia
+    SELECT
+        'null' AS nocif_faskes,
+        UPPER(namefacility) AS nama_faskes,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(namefacility,'[^a-zA-Z0-9 ]',' '),
+                '(^| )(PT|CV|TBK|LTD)( |$)',' '),
+                        '\\s+',' ')))
+            AS nama_faskes_clean,
+        -- regexp_replace(typefacility, '[^a-zA-Z0-9 ]', '') as type_faskes,
+        'null' AS norek_faskes
+    FROM edl_external.satusehat_kemkes_healthcare_facilities_fasyankes
+    WHERE typefacility IN ('["Klinik"]')  -- clinics only
+    GROUP BY 1,2,3
+),
+
+list_puskesmas_all AS (  -- puskesmas, all of Indonesia
+    SELECT
+      'null' AS nocif_faskes,
+      UPPER(nama_puskesmas) AS nama_faskes,
+      UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(nama_puskesmas,'[^a-zA-Z0-9 ]',' '),
+                '(^| )(PT|CV|TBK|LTD)( |$)',' '),
+                        '\\s+',' ')))
+            AS nama_faskes_clean,
+      'null' AS norek_faskes
+    FROM edl_sandbox.whmart_list_puskesmas_update  -- updated puskesmas register
+),
+
+-- All hospitals in Indonesia (source: SIRS Kemenkes)
+list_rs_sirs AS(
+  SELECT
+    'null' AS nocif_faskes,
+    'null' AS norek_faskes,
+    UPPER(nama) AS nama_faskes,
+    UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(nama,'[^a-zA-Z0-9 ]',' '),
+                '(^| )(PT|CV|TBK|LTD)( |$)',' '),
+                        '\\s+',' ')))
+            AS nama_faskes_clean
+  FROM edl_external.sirs_kemkes_hospital_summary
+),
+
+-- Final CTE: the universe of facility names whose transactions will be searched on the receiving side, in all banks
+all_nama_faskes_clean AS (  -- ROW_NUMBER trick: keep the BSI-customer row of an entity so that it is not duplicated
+    SELECT *
+    FROM (
+      SELECT
+        *,
+        ROW_NUMBER() OVER(
+            PARTITION BY nama_faskes
+            ORDER BY
+                CASE
+                    WHEN nocif_faskes IS NOT NULL
+                      OR norek_faskes IS NOT NULL
+                    THEN 1
+                    ELSE 2
+                END
+        ) AS rn
+      FROM (
+          SELECT nocif_faskes,norek_faskes,nama_faskes,nama_faskes_clean
+          FROM all_nasabah_faskes
+
+          UNION
+
+          SELECT nocif_faskes,norek_faskes,nama_faskes,nama_faskes_clean
+          FROM list_klinik_all
+
+          UNION
+
+          SELECT nocif_faskes,norek_faskes,nama_faskes,nama_faskes_clean
+          FROM list_puskesmas_all
+
+          UNION
+
+          SELECT nocif_faskes,norek_faskes,nama_faskes,nama_faskes_clean
+          FROM list_rs_sirs
+        ) a
+    ) b
+    WHERE rn = 1
+)
+
+SELECT *
+FROM all_nama_faskes_clean;
+
+
+/* ---------------------------------------------------------------------
+   STEP 11 : SHARED LOOKUP - COMBINED TFD TABLE (ALL SEGMENTS), JAN-AUG
+   Purpose : Union of TFD Lite (Jan-Jul + Aug) and TFD Compre. Customers that appear in both are taken from TFD Compre only.
+             This table is the transaction base for Steps 15, 16, 18 and 19.
+   Source  : da_ad_tfdlite_compre_kutu, da_ad_tfdlite_compre_kutu_aug_only_unmask, wholesale_leakage_s3d, wholesale_leakage_s3e
+   Result  : edl_sandbox.da_ad_tfdlite_compre_kutu_aug_fix, edl_sandbox.whmart_union_compre_lite_aug_fix
+   --------------------------------------------------------------------- */
+
+-- ADDITIONAL STEP: union TFD Lite Jan-Jul with TFD Lite Aug only
+-- (build the non-CB/CM TFD table first, before it is combined with CB/CM)
+CREATE TABLE edl_sandbox.da_ad_tfdlite_compre_kutu_aug_fix
+STORED AS PARQUET
+AS
+
+SELECT *
+FROM edl_sandbox.da_ad_tfdlite_compre_kutu  -- TFD Lite Jan-Jul
+
+UNION
+
+SELECT *
+FROM edl_sandbox.da_ad_tfdlite_compre_kutu_aug_only_unmask;  -- TFD Lite Aug only
+
+-- ===== Union of TFD for all segments (CB/CM + non-CB/CM) =====
+-- drop table edl_sandbox.whmart_union_compre_lite_aug_fix purge;
+CREATE TABLE edl_sandbox.whmart_union_compre_lite_aug_fix  -- inserted 17,409,751 rows on the last run
+STORED AS PARQUET
+AS
+
+WITH list_nocif_lite AS(
+  SELECT DISTINCT nocif
+  FROM edl_sandbox.da_ad_tfdlite_compre_kutu_aug_fix  -- TFD Lite table, Jan-Aug
+),
+list_nocif_s3d AS(
+  SELECT DISTINCT nocif_principal
+  FROM edl_sandbox.wholesale_leakage_s3d
+),
+
+tag_irisan AS(
+  SELECT
+  l.nocif,
+  CASE
+    WHEN s.nocif_principal IS NOT NULL THEN 1
+    ELSE 0
+    END AS flag_irisan
+  FROM list_nocif_lite l
+  LEFT JOIN list_nocif_s3d s
+    ON l.nocif = s.nocif_principal
+),
+list_nocif_irisan AS(
+  SELECT nocif
+  FROM tag_irisan
+  WHERE flag_irisan=1
+),
+all_s3e AS (
+  SELECT
+    s.nocif_principal AS nocif_principal,
+    s.nama_principal AS nama_principal,
+    s.segmen AS segmen_principal,
+    s.kodebu AS kodebu_principal,
+    s.nama_rekanan AS nama_rekanan,
+    s.bank_rekanan AS bank_rekanan,
+    s.nocif_rekanan_final AS nocif_rekanan,
+    s.flag_own AS flag_own,
+    s.flag_bsi2 AS flag_bsi,
+    s.flag_outflow_nbsi_final,
+    s.jml_bln_trx,
+    SUM(CASE WHEN s.flag='OUTGOING' THEN s.vol END) AS debit_vol,
+    SUM(CASE WHEN s.flag='INCOMING' THEN s.vol END) AS credit_vol,
+    SUM(CASE WHEN s.flag='OUTGOING' THEN s.vol_mly END) AS debit_vol_mly,
+    SUM(CASE WHEN s.flag='INCOMING' THEN s.vol_mly END) AS credit_vol_mly,
+    'compre' AS source
+  FROM edl_sandbox.wholesale_leakage_s3e s
+  WHERE s.tahun='2026'
+  AND s.flag_periode=1  -- only the Jan-Aug period
+  GROUP BY 1,2,3,4,5,6,7,8,9,10,11
+),
+all_lite AS(
+  SELECT *, debit_vol/jml_bln_trx debit_vol_mly, credit_vol/jml_bln_trx credit_vol_mly, 'lite' AS source
+  FROM (
+    SELECT
+    s.nocif AS nocif_principal,
+    s.whl_cust_name AS namacif_principal,
+    s.segmen_principal AS segmen_principal,
+    s.kodebu_principal AS kodebu_principal,
+    --,s.jenisproduk as jenisproduk
+    s.trxnt_nm AS nama_rekanan,
+    s.trxnt_bnk AS bank_rekanan,
+    s.trxnt_nocif AS nocif_rekanan,
+    s.flag_own AS flag_own,
+    IF(s.trxnt_bnk = 'Bank BSI',1,0) AS flag_bsi,
+    1 AS flag_outflow_nbsi_final,
+    COUNT(DISTINCT LEFT(batch_date,7)) jml_bln_trx,
+    SUM(CAST(s.debit_vol AS FLOAT)) AS debit_vol,
+    SUM(CAST(s.credit_vol AS FLOAT)) AS credit_vol
+    FROM edl_sandbox.da_ad_tfdlite_compre_kutu_aug_fix s  -- replace this with the TFD Lite table of the Jan-Aug period
+    WHERE nocif NOT IN (SELECT nocif FROM list_nocif_irisan)
+    AND s.flag_bsi IS NOT NULL
+    GROUP BY 1,2,3,4,5,6,7,8,9
+    ) x
+),
+gabung AS(
+  SELECT *
+  FROM all_s3e
+
+  UNION
+
+  SELECT *
+  FROM all_lite
+)
+SELECT * FROM gabung;
+
+
+/* ---------------------------------------------------------------------
+   STEP 12 : FLOW A : PUBLIC -> BPJS KESEHATAN
+   Purpose : All transactions sent by retail customers (the public) to BPJS Kesehatan (BPJS cooperatives excluded).
+   Source  : edl_datamart.dmx_transaction, edl_datamart.master_dpk_bsi (2026-08-31)
+   Result  : Query result only (no table is created)
+   --------------------------------------------------------------------- */
+
+-- All transactions from the public (retail customers) to BPJS Kesehatan
+-- List of retail (public) customers from the deposit master
+WITH list_masyarakat AS(
+    SELECT
+        nocif AS nocif_masyarakat,
+        norekening AS norekening_masyarakat,
+        namacif AS namacif_masyarakat
+    FROM edl_datamart.master_dpk_bsi
+    WHERE batch_date = '2026-08-31'
+    AND individu ='R'
+),
+
+-- Transactions where the sender is a retail customer and the receiver is BPJS Kesehatan
+temp_transaction AS(
+    SELECT
+        d.cif_no,
+        d.date_time,
+        d.dk,
+        d.amount_trx,
+        d.bank_pengirim,
+        d.bank_penerima,
+        d.rekening_sumber,
+        d.rekening_tujuan,
+        CASE
+            WHEN LOCATE(':', d.rekening_sumber) > 0
+            THEN TRIM(SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+            END AS rek_sumber_clean,
+        CASE
+            WHEN LOCATE (':', d.rekening_tujuan) > 0
+            THEN TRIM(SUBSTR(d.rekening_tujuan, 1, LOCATE(':', d.rekening_tujuan) - 1))
+            ELSE d.rekening_tujuan
+            END AS rek_tujuan_clean,
+        CASE
+            WHEN LOCATE (':', d.rekening_sumber) > 0
+            THEN TRIM(SUBSTR(d.rekening_sumber, LOCATE(':', d.rekening_sumber) + 1))
+            ELSE d.rekening_sumber
+            END AS nama_pengirim_clean,
+        CASE
+            WHEN LOCATE (':', d.rekening_tujuan) > 0
+            THEN TRIM(SUBSTR(d.rekening_tujuan, LOCATE(':', d.rekening_tujuan) + 1))
+            ELSE d.rekening_tujuan
+            END AS nama_penerima_clean,
+        UPPER(d1.namacif) AS nama_pengirim_dpk,
+        UPPER(d2.namacif) AS nama_penerima_dpk
+    FROM edl_datamart.dmx_transaction d
+
+    -- Keep transactions whose sender account number belongs to a retail customer
+    JOIN list_masyarakat lm
+        ON CASE
+            WHEN LOCATE(':', d.rekening_sumber) > 0
+            THEN TRIM (SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+        END = lm.norekening_masyarakat
+        AND d.batch_date BETWEEN '2026-01-01' AND '2026-08-31'
+        -- capture transactions where the receiver is BPJS Kesehatan
+        -- and (upper(d.rekening_tujuan) like '%BPJS KESEHATAN%' or upper(d.ati_recvr_nm) like '%BPJS KESEHATAN%')
+
+    -- Sender name from the deposit master, used when the transaction table has no identity for the sender account
+    LEFT JOIN edl_datamart.master_dpk_bsi d1
+        ON (CASE
+            WHEN LOCATE (':', d.rekening_sumber) > 0
+            THEN TRIM(SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+        END) = d1.norekening
+        AND d1.batch_date = '2026-08-31'
+
+    -- Receiver name from the deposit master, used when the transaction table has no identity for the receiver account
+    LEFT JOIN edl_datamart.master_dpk_bsi d2
+        ON (CASE
+            WHEN LOCATE (':', d.rekening_tujuan) > 0
+            THEN TRIM(SUBSTR(d.rekening_tujuan, 1, LOCATE(':', d.rekening_tujuan) - 1))
+            ELSE d.rekening_tujuan
+        END) = d2.norekening
+        AND d2.batch_date = '2026-08-31'
+
+    WHERE (UPPER(d.rekening_tujuan) LIKE '%BPJS KESEHATAN%' OR UPPER(d.ati_recvr_nm) LIKE '%BPJS KESEHATAN%')
+)
+
+SELECT DISTINCT *
+FROM temp_transaction
+WHERE UPPER(nama_penerima_clean) NOT LIKE '%KOPERASI%';  -- exclude BPJS Kesehatan cooperatives
+
+
+/* ---------------------------------------------------------------------
+   STEP 13 : FLOW B : PUBLIC -> INSURANCE COMPANIES
+   Purpose : All transactions sent by retail customers to insurance companies, matched by insurer name and by account number.
+   Source  : edl_datamart.dmx_transaction, Step 5 result, da_wholesale_base_asuransi_full
+   Result  : edl_sandbox.da_wholesale_list_asuransi_nama_clean_update2 + query result
+   --------------------------------------------------------------------- */
+
+-- All transactions from the public (retail customers) to insurance companies
+
+-- Lookup table of insurance company names (makes the transaction query easier)
+-- drop table edl_sandbox.da_wholesale_list_asuransi_nama_clean_update2
+CREATE TABLE edl_sandbox.da_wholesale_list_asuransi_nama_clean_update2
+STORED AS PARQUET
+AS
+-- Insurance companies that are BSI customers (similarity > 90%)
+WITH base_asuransi AS (
+  SELECT DISTINCT nocif_dpk AS nocif
+  FROM edl_sandbox.hasil_similarity_asuransi
+),
+
+-- Account number and name of each BSI-customer insurer, so that they can be unioned with the full list
+nasabah_bsi AS(
+    SELECT
+        b.nocif AS nocif_asuransi,
+        d.norekening AS norek_asuransi,
+        d.namacif AS namacif_asuransi,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(d.namacif,'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS namacif_asuransi_clean
+    FROM base_asuransi b
+    LEFT JOIN edl_datamart.master_dpk_bsi d
+        ON b.nocif = d.nocif
+    WHERE d.batch_date = '2026-08-31'
+    GROUP BY 1,2,3
+),
+
+-- Full list of all insurance companies in Indonesia
+all_asuransi AS (
+  SELECT DISTINCT nama_perusahaan_clean AS nama
+  FROM edl_sandbox.da_wholesale_base_asuransi_full
+),
+
+-- All insurer names, with customer / account information where the insurer is a BSI customer
+all_nama AS(
+    SELECT
+        TRIM(namacif_asuransi_clean) AS nama_asuransi_clean,
+        nocif_asuransi,
+        norek_asuransi
+    FROM nasabah_bsi
+    UNION
+    SELECT
+        TRIM(UPPER(nama)) AS nama_asuransi_clean,
+        'NULL' AS nocif_asuransi,
+        'NULL' AS norek_asuransi
+    FROM all_asuransi
+)
+
+SELECT a.*
+FROM all_nama a
+LEFT JOIN (
+    SELECT DISTINCT nama_asuransi_clean
+    FROM all_nama
+    WHERE nocif_asuransi <> 'NULL'
+) b
+    ON a.nama_asuransi_clean = b.nama_asuransi_clean
+WHERE a.nocif_asuransi <> 'NULL'
+   OR b.nama_asuransi_clean IS NULL
+ORDER BY a.nama_asuransi_clean, a.nocif_asuransi;
+
+
+-- List of retail (public) customers from the deposit master
+WITH list_masyarakat AS(
+    SELECT
+        nocif AS nocif_masyarakat,
+        namacif AS namacif_masyarakat,
+        norekening AS norekening_masyarakat
+    FROM edl_datamart.master_dpk_bsi
+    WHERE batch_date = '2026-08-31'
+    AND individu ='R'
+),
+
+-- Transactions from retail customers to insurers (matched by insurer name)
+temp_transaction1 AS(
+    SELECT DISTINCT
+        d.cif_no,
+        d.date_time,
+        d.dk,
+        d.amount_trx,
+        d.bank_pengirim,
+        d.bank_penerima,
+        d.rekening_sumber,
+        d.rekening_tujuan,
+        CASE
+            WHEN LOCATE (':', d.rekening_sumber) > 0
+            THEN TRIM(SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+            END AS rek_sumber_clean,
+        CASE
+            WHEN LOCATE (':', d.rekening_tujuan) > 0
+            THEN TRIM(SUBSTR(d.rekening_tujuan, 1, LOCATE(':', d.rekening_tujuan) - 1))
+            ELSE d.rekening_tujuan
+            END AS rek_tujuan_clean,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(rekening_sumber, LOCATE(':', rekening_sumber) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS nama_pengirim_clean,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(rekening_tujuan, LOCATE(':', rekening_tujuan) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS nama_penerima_clean,
+        UPPER(d1.namacif) AS nama_pengirim_dpk,
+        UPPER(d2.namacif) AS nama_penerima_dpk
+    FROM edl_datamart.dmx_transaction d
+
+    -- Keep only transactions whose sender account number is in the retail-customer list
+    JOIN list_masyarakat lm
+        ON CASE
+            WHEN LOCATE(':', d.rekening_sumber) > 0
+            THEN TRIM (SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+        END = lm.norekening_masyarakat
+
+    -- Keep only transactions whose receiver name is in the insurer lookup table created above
+    JOIN edl_sandbox.da_wholesale_list_asuransi_nama_clean_update2 cu
+        ON UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_tujuan, LOCATE(':', d.rekening_tujuan) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            = cu.nama_asuransi_clean
+
+    -- Sender name, for accounts with no identity in the transaction table
+    LEFT JOIN edl_datamart.master_dpk_bsi d1
+        ON (CASE
+            WHEN LOCATE (':', d.rekening_sumber) > 0
+            THEN TRIM(SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+        END) = d1.norekening
+        AND d1.batch_date = '2026-08-31'
+
+    -- Receiver name, for accounts with no identity in the transaction table
+    LEFT JOIN edl_datamart.master_dpk_bsi d2
+        ON (CASE
+            WHEN LOCATE (':', d.rekening_tujuan) > 0
+            THEN TRIM(SUBSTR(d.rekening_tujuan, 1, LOCATE(':', d.rekening_tujuan) - 1))
+            ELSE d.rekening_tujuan
+        END) = d2.norekening
+        AND d2.batch_date = '2026-08-31'
+
+    WHERE d.batch_date BETWEEN '2026-01-01' AND '2026-08-31'
+),
+
+-- Second pass: transactions that only carry account numbers (no name for the sender or the receiver)
+-- Run as a separate query because combining it with the name-based joins is too heavy
+temp_transaction2 AS (
+    SELECT DISTINCT
+        d.cif_no,
+        d.date_time,
+        d.dk,
+        d.amount_trx,
+        d.bank_pengirim,
+        d.bank_penerima,
+        d.rekening_sumber,
+        d.rekening_tujuan,
+        CASE
+            WHEN LOCATE (':', d.rekening_sumber) > 0
+            THEN TRIM(SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+            END AS rek_sumber_clean,
+        CASE
+            WHEN LOCATE (':', d.rekening_tujuan) > 0
+            THEN TRIM(SUBSTR(d.rekening_tujuan, 1, LOCATE(':', d.rekening_tujuan) - 1))
+            ELSE d.rekening_tujuan
+            END AS rek_tujuan_clean,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_sumber, LOCATE(':', d.rekening_sumber) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS nama_pengirim_clean,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_tujuan, LOCATE(':', d.rekening_tujuan) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS nama_penerima_clean,
+        UPPER(d1.namacif) AS nama_pengirim_dpk,
+        UPPER(d2.namacif) AS nama_penerima_dpk
+
+    FROM edl_datamart.dmx_transaction d
+
+    -- Join with the retail-customer list to pick up transactions by sender account number
+    JOIN list_masyarakat lm
+        ON lm.norekening_masyarakat = d.rekening_sumber
+
+    -- Join with the insurer lookup table: the receiver account number must be a known insurer account
+    JOIN edl_sandbox.da_wholesale_list_asuransi_nama_clean_update2 cu
+        ON cu.norek_asuransi = d.rekening_tujuan
+
+    -- Identity details of the sender, not available in the transaction table
+    LEFT JOIN edl_datamart.master_dpk_bsi d1
+        ON d.rekening_sumber = d1.norekening
+        AND d1.batch_date = '2026-08-31'
+
+    -- Identity details of the receiver, not available in the transaction table
+    LEFT JOIN edl_datamart.master_dpk_bsi d2
+        ON d.rekening_tujuan = d2.norekening
+        AND d2.batch_date = '2026-08-31'
+
+    WHERE d.batch_date BETWEEN '2026-01-01' AND '2026-08-31'
+)
+
+-- Union of both passes: all transactions from retail customers to insurers
+SELECT *
+FROM temp_transaction1
+UNION
+SELECT *
+FROM temp_transaction2;
+
+
+/* ---------------------------------------------------------------------
+   STEP 14 : FLOW C : PUBLIC -> HEALTHCARE FACILITIES
+   Purpose : All transactions sent by retail customers to clinics, puskesmas and hospitals (DOMPET DHUAFA excluded).
+   Source  : edl_datamart.dmx_transaction, da_wholesale_nama_universe_faskes_clean (Step 10)
+   Result  : Query result only (no table is created)
+   --------------------------------------------------------------------- */
+
+-- ===== Transactions from the public to healthcare facilities =====
+WITH list_masyarakat AS(
+    SELECT
+        nocif AS nocif_masyarakat,
+        namacif AS namacif_masyarakat,
+        norekening AS norekening_masyarakat
+    FROM edl_datamart.master_dpk_bsi
+    WHERE batch_date = '2026-08-31'
+    AND individu ='R'
+),
+
+-- Transactions from retail customers to the facility universe (matched by facility name)
+temp_transaction1 AS(
+    SELECT DISTINCT
+        d.cif_no,
+        d.date_time,
+        d.dk,
+        d.amount_trx,
+        d.bank_pengirim,
+        d.bank_penerima,
+        d.rekening_sumber,
+        d.rekening_tujuan,
+        d.channel_category,
+        d.channel1,
+        d.channel2,
+        d.category,
+        d.detail_category,
+        CASE
+          WHEN LOCATE (':', d.rekening_sumber) > 0
+          THEN TRIM(SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+          ELSE d.rekening_sumber
+          END AS rek_sumber_clean,
+
+        CASE
+          WHEN LOCATE (':', d.rekening_tujuan) > 0
+          THEN TRIM(SUBSTR(d.rekening_tujuan, 1, LOCATE(':', d.rekening_tujuan) - 1))
+          ELSE d.rekening_tujuan
+          END AS rek_tujuan_clean,
+
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_sumber, LOCATE(':', d.rekening_sumber) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS nama_pengirim_clean,
+
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_tujuan, LOCATE(':', d.rekening_tujuan) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS nama_penerima_clean,
+
+        UPPER(d1.namacif) AS nama_pengirim_dpk,
+        UPPER(d2.namacif) AS nama_penerima_dpk
+    FROM edl_datamart.dmx_transaction d  -- the DMX table is still used because the TFD table does not capture individual customers (individu = 'R')
+
+    -- Keep transactions whose sender is in the retail-customer list (by account number)
+    JOIN list_masyarakat lm
+        ON CASE
+            WHEN LOCATE(':', d.rekening_sumber) > 0
+            THEN TRIM (SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+        END = lm.norekening_masyarakat
+
+    -- Keep transactions whose receiver is in the facility list (by name)
+    JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+        ON UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_tujuan, LOCATE(':', d.rekening_tujuan) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            = uf.nama_faskes_clean
+
+    -- Sender name, for accounts with no identity in the transaction table
+    LEFT JOIN edl_datamart.master_dpk_bsi d1
+        ON (CASE
+            WHEN LOCATE (':', d.rekening_sumber) > 0
+            THEN TRIM(SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+        END) = d1.norekening
+        AND d1.batch_date = '2026-08-31'
+
+    -- Receiver name, for accounts with no identity in the transaction table
+    LEFT JOIN edl_datamart.master_dpk_bsi d2
+        ON (CASE
+            WHEN LOCATE (':', d.rekening_tujuan) > 0
+            THEN TRIM(SUBSTR(d.rekening_tujuan, 1, LOCATE(':', d.rekening_tujuan) - 1))
+            ELSE d.rekening_tujuan
+        END) = d2.norekening
+        AND d2.batch_date = '2026-08-31'
+
+    WHERE d.batch_date BETWEEN '2026-01-01' AND '2026-08-31'
+      AND d2.individu='C'
+      AND UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_tujuan, LOCATE(':', d.rekening_tujuan) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+          NOT IN ('DOMPET DHUAFA')
+),
+
+-- Second pass: transactions with no identity at all on the source / destination accounts (account number only)
+temp_transaction2 AS (
+    SELECT
+        d.cif_no,
+        d.date_time,
+        d.dk,
+        d.amount_trx,
+        d.bank_pengirim,
+        d.bank_penerima,
+        d.rekening_sumber,
+        d.rekening_tujuan,
+        d.channel_category,
+        d.channel1,
+        d.channel2,
+        d.category,
+        d.detail_category,
+        CASE
+            WHEN LOCATE (':', d.rekening_sumber) > 0
+            THEN TRIM(SUBSTR(d.rekening_sumber, 1, LOCATE(':', d.rekening_sumber) - 1))
+            ELSE d.rekening_sumber
+            END AS rek_sumber_clean,
+        CASE
+            WHEN LOCATE (':', d.rekening_tujuan) > 0
+            THEN TRIM(SUBSTR(d.rekening_tujuan, 1, LOCATE(':', d.rekening_tujuan) - 1))
+            ELSE d.rekening_tujuan
+            END AS rek_tujuan_clean,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_sumber, LOCATE(':', d.rekening_sumber) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS nama_pengirim_clean,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_tujuan, LOCATE(':', d.rekening_tujuan) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS nama_penerima_clean,
+        UPPER(d1.namacif) AS nama_pengirim_dpk,
+        UPPER(d2.namacif) AS nama_penerima_dpk
+
+    FROM edl_datamart.dmx_transaction d
+
+    -- The sender must be in the retail-customer list (by account number)
+    JOIN list_masyarakat lm
+        ON lm.norekening_masyarakat = d.rekening_sumber
+
+    -- The receiver must be in the facility table built above (by account number)
+    JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean ufc
+        ON ufc.norek_faskes = d.rekening_tujuan
+
+    -- Identity details of the sender, not available in the transaction table
+    LEFT JOIN edl_datamart.master_dpk_bsi d1
+        ON d.rekening_sumber = d1.norekening
+        AND d1.batch_date = '2026-08-31'
+
+    -- Identity details of the receiver, not available in the transaction table
+    LEFT JOIN edl_datamart.master_dpk_bsi d2
+        ON d.rekening_tujuan = d2.norekening
+        AND d2.batch_date = '2026-08-31'
+
+    WHERE d.batch_date BETWEEN '2026-01-01' AND '2026-08-31'
+      AND d2.individu='C'
+      AND UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(SUBSTR(d.rekening_tujuan, LOCATE(':', d.rekening_tujuan) + 1)),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+          NOT IN ('DOMPET DHUAFA')
+)
+
+-- Union of both passes: all transactions from retail customers to healthcare facilities
+SELECT *
+FROM temp_transaction1
+UNION
+SELECT *
+FROM temp_transaction2;
+
+
+/* ---------------------------------------------------------------------
+   STEP 15 : FLOW D : BPJS KESEHATAN -> HEALTHCARE FACILITIES
+   Purpose : All transactions between BPJS Kesehatan and healthcare facilities, with a flag showing which side is a facility.
+   Source  : whmart_union_compre_lite_aug_fix (Step 11), da_wholesale_nama_universe_faskes_clean (Step 10)
+   Result  : Query result only (no table is created)
+   --------------------------------------------------------------------- */
+
+-- ===== All transactions from BPJS Kesehatan to healthcare facilities =====
+
+-- Tag the names that are healthcare facilities, on the principal side
+WITH tmp_principal_faskes_tag AS (
+  SELECT DISTINCT
+    a.nama_principal,
+    uf.nama_faskes_clean AS faskes_principal
+  FROM edl_sandbox.whmart_union_compre_lite_aug_fix a
+  LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+        ON UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(a.nama_principal),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            = uf.nama_faskes_clean
+),
+
+-- Tag the names that are healthcare facilities, on the counterparty (rekanan) side
+tmp_rekanan_faskes_tag AS (
+  SELECT DISTINCT
+    a.nama_rekanan,
+    uf.nama_faskes_clean AS faskes_rekanan
+FROM edl_sandbox.whmart_union_compre_lite_aug_fix a
+LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+        ON UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(a.nama_rekanan),'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            = uf.nama_faskes_clean
+),
+
+-- All transactions between BPJS Kesehatan and healthcare facilities (BPJS as principal with outgoing money, or as counterparty with incoming money to the facility)
+tmp_trx AS (
+  SELECT a.*,
+    pf.faskes_principal,
+    rf.faskes_rekanan,
+    CASE WHEN pf.faskes_principal IS NOT NULL THEN 'Y' ELSE 'N' END AS flag_faskes_as_principal,
+    CASE WHEN rf.faskes_rekanan IS NOT NULL THEN 'Y' ELSE 'N' END AS flag_faskes_as_rekanan
+  FROM edl_sandbox.whmart_union_compre_lite_aug_fix a
+  LEFT JOIN tmp_principal_faskes_tag pf ON pf.nama_principal = a.nama_principal
+  LEFT JOIN tmp_rekanan_faskes_tag rf ON rf.nama_rekanan = a.nama_rekanan
+  WHERE (UPPER(a.nama_principal) RLIKE 'BPJS KESEHATAN|BPJS KES' AND a.debit_vol > 0 AND rf.faskes_rekanan IS NOT NULL)
+    OR (UPPER(a.nama_rekanan) RLIKE 'BPJS KESEHATAN|BPJS KES' AND a.credit_vol > 0 AND pf.faskes_principal IS NOT NULL)
+)
+SELECT *
+FROM tmp_trx;
+
+
+/* ---------------------------------------------------------------------
+   STEP 16 : FLOW E : INSURANCE COMPANIES -> HEALTHCARE FACILITIES
+   Purpose : All transactions between insurance companies and healthcare facilities (BPJS Kesehatan excluded).
+   Source  : whmart_union_compre_lite_aug_fix (Step 11), da_wholesale_nama_universe_faskes_clean (Step 10), Step 5 result
+   Result  : edl_sandbox.da_wholesale_list_asuransi_nama_clean_update + query result
+   --------------------------------------------------------------------- */
+
+-- Table of the insurance companies that are BSI customers, used later to pull their transactions to facilities
+-- drop table edl_sandbox.da_wholesale_list_asuransi_nama_clean_update
+CREATE TABLE edl_sandbox.da_wholesale_list_asuransi_nama_clean_update
+STORED AS PARQUET
+AS
+-- Insurance companies that are BSI customers (similarity > 90%)
+WITH base_asuransi AS (
+  SELECT DISTINCT nocif_dpk AS nocif
+  FROM edl_sandbox.hasil_similarity_asuransi
+),
+
+-- Names of BSI-customer insurers, so that they can be unioned to build the full list of names
+nasabah_bsi AS(
+    SELECT
+        b.nocif AS nocif_asuransi,
+        d.norekening AS norek_asuransi,
+        d.namacif AS namacif_asuransi,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(d.namacif,'[^a-zA-Z0-9 ]',''),
+                '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                    '\\s+',' ')))
+            AS namacif_asuransi_clean
+    FROM base_asuransi b
+    LEFT JOIN edl_datamart.master_dpk_bsi d
+        ON b.nocif = d.nocif
+    WHERE d.batch_date = '2026-08-31'
+    GROUP BY 1,2,3
+),
+
+-- Full list of all insurance companies in Indonesia
+all_asuransi AS (
+  SELECT DISTINCT nama_perusahaan_clean AS nama
+  FROM edl_sandbox.da_wholesale_base_asuransi_full
+),
+
+-- All insurer names, with customer information where the insurer is a BSI customer
+all_nama AS(
+    SELECT
+        TRIM(namacif_asuransi_clean) AS nama_asuransi_clean,
+        nocif_asuransi
+    FROM nasabah_bsi
+    UNION
+    SELECT
+        TRIM(UPPER(nama)) AS nama_asuransi_clean,
+        'NULL' AS nocif_asuransi
+    FROM all_asuransi
+)
+
+SELECT a.*
+FROM all_nama a
+LEFT JOIN (
+    SELECT DISTINCT nama_asuransi_clean
+    FROM all_nama
+    WHERE nocif_asuransi <> 'NULL'
+) b
+    ON a.nama_asuransi_clean = b.nama_asuransi_clean
+WHERE a.nocif_asuransi <> 'NULL'
+   OR b.nama_asuransi_clean IS NULL
+ORDER BY a.nama_asuransi_clean;
+
+
+-- All transactions from insurance companies to healthcare facilities
+-- First, clean the principal and counterparty names
+WITH union_compre_lite_clean AS(
+  SELECT *,
+      UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(nama_rekanan,'[^a-zA-Z0-9 ]',' '),
+        '(^| )(PT|CV|TBK|LTD)( |$)',' '),
+            '\\s+',' ')))
+      AS nama_rekanan_clean,
+      UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(nama_principal,'[^a-zA-Z0-9 ]',' '),
+        '(^| )(PT|CV|TBK|LTD)( |$)',' '),
+            '\\s+',' ')))
+      AS nama_principal_clean
+  FROM edl_sandbox.whmart_union_compre_lite_aug_fix
+),
+
+-- Tag whether the principal is an insurer or a facility
+tmp_principal_tag AS (
+  SELECT DISTINCT
+    a.nama_principal,
+    uf.nama_faskes_clean AS faskes_principal,
+    la.nama_asuransi_clean AS asuransi_principal
+  FROM union_compre_lite_clean a
+  LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+    ON a.nama_principal_clean = uf.nama_faskes_clean
+  LEFT JOIN edl_sandbox.da_wholesale_list_asuransi_nama_clean_update la
+    ON a.nama_principal_clean = la.nama_asuransi_clean
+
+  UNION
+
+  SELECT DISTINCT
+    a.nama_principal,
+    uf.nama_faskes_clean AS faskes_principal,
+    la.nama_asuransi_clean AS asuransi_principal
+  FROM union_compre_lite_clean a
+  LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+    ON a.nocif_principal = uf.nocif_faskes
+  LEFT JOIN edl_sandbox.da_wholesale_list_asuransi_nama_clean_update la
+    ON a.nocif_principal = la.nocif_asuransi
+
+),
+
+-- Tag whether the counterparty is an insurer or a facility
+tmp_rekanan_tag AS (
+  SELECT DISTINCT
+    a.nama_rekanan,
+    uf.nama_faskes_clean AS faskes_rekanan,
+    la.nama_asuransi_clean AS asuransi_rekanan
+  FROM union_compre_lite_clean a
+  LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+    ON a.nama_rekanan_clean = uf.nama_faskes_clean
+  LEFT JOIN edl_sandbox.da_wholesale_list_asuransi_nama_clean_update la
+    ON a.nama_rekanan_clean = la.nama_asuransi_clean
+
+  UNION
+
+  SELECT DISTINCT
+    a.nama_rekanan,
+    uf.nama_faskes_clean AS faskes_rekanan,
+    la.nama_asuransi_clean AS asuransi_rekanan
+  FROM union_compre_lite_clean a
+  LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+    ON a.nocif_rekanan = uf.nocif_faskes
+  LEFT JOIN edl_sandbox.da_wholesale_list_asuransi_nama_clean_update la
+    ON a.nocif_rekanan = la.nocif_asuransi
+
+),
+
+-- All insurer-to-facility transactions, covering both the principal and the counterparty cases
+tmp_trx AS (
+  SELECT a.*,
+    pf.faskes_principal,
+    pf.asuransi_principal,
+    rf.faskes_rekanan,
+    rf.asuransi_rekanan
+  FROM edl_sandbox.whmart_union_compre_lite_aug_fix a
+  LEFT JOIN tmp_principal_tag pf
+    ON pf.nama_principal = a.nama_principal
+  LEFT JOIN tmp_rekanan_tag rf
+    ON rf.nama_rekanan = a.nama_rekanan
+  WHERE (pf.faskes_principal IS NOT NULL AND rf.asuransi_rekanan IS NOT NULL AND credit_vol IS NOT NULL)
+     OR (pf.asuransi_principal IS NOT NULL AND rf.faskes_rekanan IS NOT NULL AND debit_vol IS NOT NULL)
+)
+
+SELECT *
+FROM tmp_trx
+WHERE NOT (nama_principal = 'BPJS KESEHATAN'
+  OR nama_rekanan = 'BPJS KESEHATAN');
+
+
+/* ---------------------------------------------------------------------
+   STEP 17 : FLOW F : HEALTHCARE FACILITIES -> PAYROLL
+   Purpose : Payroll paid by facilities: total amount, number of employees and payroll per employee per month, for all staff and for healthcare workers only.
+   Source  : edl_datamart.master_payroll_phr_kolaborasi (2026-01-01 to 2026-08-31), whmart_healthcare_dict_flag_payroll
+   Result  : Query result only (no table is created)
+   --------------------------------------------------------------------- */
+
+-- All payroll transactions, for all employees
+-- Payroll summary per institution, without excluding non-healthcare staff
+WITH payroll_all AS(
+    SELECT
+        instansifinal AS nama_raw,
+        TRIM(UPPER(instansifinal)) AS nama_clean,
+        ROUND(SUM(nominalpayroll),0) AS total_payroll_all_karyawan,
+        COUNT(DISTINCT namacif) AS total_karyawan_all,
+        ROUND(SUM(nominalpayroll) / COUNT(DISTINCT namacif) /8,0) AS payroll_permon_perpegawai_all
+    FROM edl_datamart.master_payroll_phr_kolaborasi
+    WHERE batch_date BETWEEN '2026-01-01' AND '2026-08-31'
+    AND categorysegmen='RS'
+    GROUP BY 1,2
+),
+
+-- Payroll transactions where the recipient is a healthcare worker only
+-- Payroll summary per institution, counting healthcare workers only
+payroll_nakes_only AS (
+    SELECT
+        instansifinal AS nama_raw,
+        TRIM(UPPER(instansifinal)) AS nama_clean,
+        ROUND(SUM(nominalpayroll),0) AS total_payroll_nakes_only,
+        COUNT(DISTINCT namacif) AS total_karyawan_nakes_only,
+        ROUND(SUM(nominalpayroll) / COUNT(DISTINCT namacif) /8,0) AS payroll_permon_perpegawai_nakes_only
+    FROM edl_datamart.master_payroll_phr_kolaborasi
+    WHERE batch_date BETWEEN '2026-01-01' AND '2026-08-31'
+    AND categorysegmen='RS'
+    AND occupation IN ( select distinct occupation from edl_sandbox.list_occupation
+    )
+    GROUP BY 1,2
+),
+
+-- Combine the all-employee summary with the healthcare-worker-only summary
+gabung AS(
+    SELECT
+        -- payroll: all employees
+        a.nama_raw,
+        a.nama_clean,
+        a.total_payroll_all_karyawan,
+        a.total_karyawan_all,
+        a.payroll_permon_perpegawai_all,
+
+        -- payroll: healthcare workers only
+        n.total_payroll_nakes_only,
+        n.total_karyawan_nakes_only,
+        n.payroll_permon_perpegawai_nakes_only,
+        CASE WHEN fp1.flag_bsi IS NULL THEN 0 ELSE 1 END AS flag_bsi,
+        CASE WHEN fp1.flag_faskes ='Non' THEN 0 ELSE 1 END AS flag_faskes,
+        CASE WHEN (fp1.flag_bsi IS NOT NULL AND fp1.flag_faskes ='Faskes') THEN 'Y' ELSE 'N' END AS flag_payroll_faskes
+    FROM payroll_all a
+    LEFT JOIN payroll_nakes_only n
+      ON a.nama_raw = n.nama_raw
+    LEFT JOIN edl_sandbox.whmart_healthcare_dict_flag_payroll fp1
+      ON a.nama_clean = fp1.nama_instansi
+)
+
+SELECT DISTINCT *
+FROM gabung
+ORDER BY total_payroll_all_karyawan DESC;
+
+
+/* ---------------------------------------------------------------------
+   STEP 18 : FLOW G : HEALTHCARE FACILITIES -> PHARMACEUTICAL WHOLESALERS (PBF)
+   Purpose : All transactions between healthcare facilities and PBFs (BSI-customer PBFs plus all PBFs in Indonesia).
+   Source  : whmart_union_compre_lite_aug_fix (Step 11), Step 8 result, da_wholesale_detail_lokasi_pbf
+   Result  : edl_sandbox.whmart_healthcare_base_pbf, da_wholesale_list_pbf_lengkap, da_wholesale_trx_outgoing_faskes_pbf_only
+   --------------------------------------------------------------------- */
+
+-- NOTE: this step expects a column  tag  ('pbf') in hasil_similarity_farmasi_apotek, but the Step 8 table
+-- does not have that column. The tag must come from an updated version of that table.
+-- ===== Build the BASE LIST of BSI-customer PBFs whose transactions will be pulled =====
+-- Rule to tag whether the nocif of a BSI customer belongs to a PBF or a medical-device (alkes) company,
+-- taken from the table prepared by Ms. Put
+CREATE TABLE edl_sandbox.whmart_healthcare_base_pbf
+STORED AS PARQUET
+AS
+WITH nocif_nasabah_pbf AS (
+  SELECT DISTINCT nocif_dpk
+  FROM edl_sandbox.hasil_similarity_farmasi_apotek
+  WHERE tag='pbf'
+),
+
+nocif_nasabah_alkes AS (
+  SELECT DISTINCT nocif_dpk
+  FROM edl_sandbox.hasil_similarity_alkes
+),
+
+-- Add flag_pbf, flag_alkes and the final tag
+add_tag AS (
+  SELECT
+    pa.*,
+    CASE WHEN np.nocif_dpk IS NOT NULL THEN 1 ELSE 0 END AS flag_pbf,
+    CASE WHEN na.nocif_dpk IS NOT NULL THEN 1 ELSE 0 END AS flag_alkes,
+    CASE WHEN np.nocif_dpk IS NOT NULL THEN 'pbf' ELSE 'alkes' END AS tag
+  FROM edl_sandbox.whmart_healthcare_s1c_potensi_casa_bewize_pbf_alkes pa
+  LEFT JOIN nocif_nasabah_pbf np
+    ON pa.nocif_dpk = np.nocif_dpk
+  LEFT JOIN nocif_nasabah_alkes na
+    ON pa.nocif_dpk = na.nocif_dpk
+)
+
+-- List of BSI-customer PBFs, to be unioned with the nationwide PBF list so that their transactions can be found
+SELECT DISTINCT  -- 171 rows on the last run
+  nocif_dpk,
+  -- ,namacif_dpk
+  nama_raw AS nama_pbf_raw,
+  UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(nama_raw,'[^a-zA-Z0-9 ]',' '),
+      '(^| )(PT|CV|TBK|LTD)( |$)',' '),
+      '\\s+',' ')))
+  AS nama_pbf_clean
+FROM add_tag
+WHERE tag ='pbf';
+
+
+-- Universe of complete PBF names whose transactions will be searched
+-- drop table edl_sandbox.da_wholesale_list_pbf_lengkap
+CREATE TABLE edl_sandbox.da_wholesale_list_pbf_lengkap
+STORED AS PARQUET
+AS
+-- Names of all PBFs in Indonesia
+WITH list_pbf AS (
+  SELECT DISTINCT
+    nama_pedagang_besar_farmasi_clean AS nama_pbf_clean
+  FROM edl_sandbox.da_wholesale_detail_lokasi_pbf  -- all PBFs in Indonesia, with location details
+),
+
+-- Names of all PBFs, with the customer number (nocif) added
+list_pbf_indo AS (
+SELECT DISTINCT
+  lp.nama_pbf_clean,
+  d.nocif AS nocif_pbf
+FROM list_pbf lp
+LEFT JOIN (SELECT DISTINCT nocif, namacif FROM edl_datamart.master_dpk_bsi WHERE batch_date='2026-08-31') d
+ON lp.nama_pbf_clean = d.namacif
+)
+
+-- Union of the nationwide PBF list and the BSI-customer PBFs
+SELECT
+  nama_pbf_clean,
+  nocif_pbf
+FROM list_pbf_indo
+UNION
+SELECT
+  nama_pbf_clean,
+  nocif_dpk AS nocif_pbf
+FROM edl_sandbox.whmart_healthcare_base_pbf;  -- temp table holding only the BSI-customer PBFs, with their nocif
+
+
+-- ===== Transactions from healthcare facilities to PBF =====
+-- drop table edl_sandbox.da_wholesale_trx_outgoing_faskes_pbf_only
+CREATE TABLE edl_sandbox.da_wholesale_trx_outgoing_faskes_pbf_only
+STORED AS PARQUET
+AS
+WITH tmp_union_compre_lite AS (
+  SELECT DISTINCT
+    a.nocif_principal,
+    a.nocif_rekanan,
+    a.nama_principal,
+    UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(a.nama_principal),'[^a-zA-Z0-9 ]',''),
+                  '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                      '\\s+',' '))) AS nama_principal_clean,
+    a.nama_rekanan,
+    UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(a.nama_rekanan),'[^a-zA-Z0-9 ]',''),
+                  '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                      '\\s+',' '))) AS nama_rekanan_clean
+  FROM edl_sandbox.whmart_union_compre_lite_aug_fix a
+),
+
+tmp_principal_tag AS (
+  SELECT DISTINCT
+    a.nocif_principal,
+    a.nama_principal,
+    uf.nama_faskes_clean AS faskes_principal,
+    pl.nama_pbf_clean AS pbf_principal
+  FROM tmp_union_compre_lite a
+  LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+    ON a.nocif_principal = uf.nocif_faskes
+  LEFT JOIN edl_sandbox.da_wholesale_list_pbf_lengkap pl
+    ON a.nocif_principal = pl.nocif_pbf
+
+  UNION
+
+  SELECT DISTINCT
+    a.nocif_principal,
+    a.nama_principal,
+    uf.nama_faskes_clean AS faskes_principal,
+    pl.nama_pbf_clean AS pbf_principal
+  FROM tmp_union_compre_lite a
+  LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+    ON a.nama_principal_clean = uf.nama_faskes_clean
+  LEFT JOIN edl_sandbox.da_wholesale_list_pbf_lengkap pl
+    ON a.nama_principal_clean = pl.nama_pbf_clean
+),
+
+tmp_rekanan_tag AS (
+  SELECT DISTINCT
+    a.nama_rekanan,
+    uf.nama_faskes_clean AS faskes_rekanan,
+    pl.nama_pbf_clean AS pbf_rekanan
+  FROM tmp_union_compre_lite a
+  LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+    ON a.nama_rekanan_clean = uf.nama_faskes_clean
+  LEFT JOIN edl_sandbox.da_wholesale_list_pbf_lengkap pl
+    ON a.nama_rekanan_clean = pl.nama_pbf_clean
+
+  UNION
+
+  SELECT DISTINCT
+    a.nama_rekanan,
+    uf.nama_faskes_clean AS faskes_rekanan,
+    pl.nama_pbf_clean AS pbf_rekanan
+  FROM tmp_union_compre_lite a
+  LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean uf
+    ON a.nocif_rekanan = uf.nocif_faskes
+  LEFT JOIN edl_sandbox.da_wholesale_list_pbf_lengkap pl
+    ON a.nocif_rekanan = pl.nocif_pbf
+),
+
+tmp_trx AS (
+  SELECT a.*,
+    pf.faskes_principal,
+    pf.pbf_principal,
+    rf.faskes_rekanan,
+    rf.pbf_rekanan
+    -- ,case when pf.faskes_principal is not null then 'Y' else 'N' end as flag_faskes_as_principal
+    -- ,case when rf.farmasi_rekanan is not null then 'Y' else 'N' end as flag_farmasi_as_rekanan
+  FROM edl_sandbox.whmart_union_compre_lite_aug_fix a
+  LEFT JOIN tmp_principal_tag pf
+    ON a.nama_principal = pf.nama_principal
+  LEFT JOIN tmp_rekanan_tag rf
+    ON a.nama_rekanan = rf.nama_rekanan
+  WHERE (pf.faskes_principal IS NOT NULL AND rf.pbf_rekanan IS NOT NULL AND debit_vol IS NOT NULL)
+    OR (pf.pbf_principal IS NOT NULL AND rf.faskes_rekanan IS NOT NULL AND credit_vol IS NOT NULL)
+)
+
+SELECT DISTINCT *
+FROM tmp_trx
+WHERE nama_rekanan <> "";
+
+-- Export the data to look at the transaction details
+-- select *
+-- from edl_sandbox.da_wholesale_trx_outgoing_faskes_pbf_only
+
+
+/* ---------------------------------------------------------------------
+   STEP 19 : FLOW H : HEALTHCARE FACILITIES -> MEDICAL-DEVICE (ALKES) COMPANIES
+   Purpose : All transactions between healthcare facilities and medical-device companies.
+   Source  : whmart_union_compre_lite_aug_fix (Step 11), da_wholesale_nama_universe_faskes_clean (Step 10), Step 9 result
+   Result  : edl_sandbox.da_wholesale_alkes_clean_update, da_wholesale_trx_outgoing_faskes_alkes_only
+   --------------------------------------------------------------------- */
+
+-- Universe of medical-device (alkes) company names in Indonesia
+-- drop table edl_sandbox.da_wholesale_alkes_clean_update
+CREATE TABLE edl_sandbox.da_wholesale_alkes_clean_update
+STORED AS PARQUET
+AS
+WITH base_alkes AS(
+    SELECT
+        pendaftar AS nama_alkes,
+        UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(pendaftar,'[^a-zA-Z0-9 ]',''),
+                        '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                                '\\s+',' ')))
+            AS nama_alkes_clean,
+        alamat_pendaftar AS alamat_alkes,
+        batch_date
+    FROM edl_external.infoalkes_kemkes_rekapitulasi_izin_edar_alkes_dalam_negeri
+),
+
+-- Names of all medical-device companies in Indonesia
+base_kemkes AS (
+  SELECT DISTINCT
+    ba.nama_alkes,
+    ba.nama_alkes_clean,
+    d.nocif AS nocif_alkes
+  FROM base_alkes ba
+  LEFT JOIN (SELECT DISTINCT nocif, namacif FROM edl_datamart.master_dpk_bsi WHERE batch_date='2026-07-26') d
+  ON ba.nama_alkes_clean = UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(d.namacif,'[^a-zA-Z0-9 ]',''),
+                              '(^| )(PT|CV|TBK|LTD)( |$)',''),
+                                  '\\s+',' ')))
+)
+
+-- Union of the nationwide alkes list and the BSI-customer alkes companies
+
+SELECT *
+FROM (
+  SELECT *,
+    ROW_NUMBER () OVER (
+      PARTITION BY nama_alkes
+      ORDER BY
+        CASE WHEN nocif_alkes IS NOT NULL THEN 1
+        ELSE 2
+      END) AS rn
+  FROM (
+      SELECT
+      nama_alkes,
+      nama_alkes_clean,
+      nocif_alkes
+    FROM base_kemkes
+    UNION
+    SELECT
+      nama_alkes,
+      nama_alkes_clean,
+      nocif_dpk AS nocif_alkes
+    FROM edl_sandbox.hasil_similarity_alkes
+  ) a
+) b
+WHERE rn=1;
+
+
+-- All transactions from healthcare facilities to medical-device companies
+-- First, clean the principal and counterparty names
+-- drop table edl_sandbox.da_wholesale_trx_outgoing_faskes_alkes_only
+CREATE TABLE edl_sandbox.da_wholesale_trx_outgoing_faskes_alkes_only
+STORED AS PARQUET
+AS
+WITH union_compre_lite_clean AS(
+  SELECT *,
+      UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(nama_rekanan,'[^a-zA-Z0-9 ]',' '),
+        '(^| )(PT|CV|TBK|LTD)( |$)',' '),
+            '\\s+',' ')))
+      AS nama_rekanan_clean,
+      UPPER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(nama_principal,'[^a-zA-Z0-9 ]',' '),
+        '(^| )(PT|CV|TBK|LTD)( |$)',' '),
+            '\\s+',' ')))
+      AS nama_principal_clean
+  FROM edl_sandbox.whmart_union_compre_lite_aug_fix
+),
+
+-- Tag whether the principal is a facility or a medical-device company
+tmp_principal_tag AS (
+ SELECT DISTINCT
+  a.nama_principal,
+  fc.nama_faskes_clean AS faskes_principal,
+  ac.nama_alkes_clean AS alkes_principal
+ FROM union_compre_lite_clean a
+ LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean fc
+        ON a.nama_principal_clean = fc.nama_faskes_clean
+  LEFT JOIN edl_sandbox.da_wholesale_alkes_clean_update ac
+        ON a.nama_principal_clean = ac.nama_alkes_clean
+
+  UNION
+
+ SELECT DISTINCT
+  a.nama_principal,
+  fc.nama_faskes_clean AS faskes_principal,
+  ac.nama_alkes_clean AS alkes_principal
+ FROM union_compre_lite_clean a
+ LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean fc
+        ON a.nocif_principal = fc.nocif_faskes
+  LEFT JOIN edl_sandbox.da_wholesale_alkes_clean_update ac
+        ON a.nocif_principal = ac.nocif_alkes
+),
+
+-- Tag whether the counterparty is a facility or a medical-device company
+tmp_rekanan_tag AS (
+ SELECT DISTINCT
+  a.nama_rekanan,
+  fc.nama_faskes_clean AS faskes_rekanan,
+  ac.nama_alkes_clean AS alkes_rekanan
+ FROM union_compre_lite_clean a
+ LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean fc
+        ON a.nama_rekanan_clean = fc.nama_faskes_clean
+  LEFT JOIN edl_sandbox.da_wholesale_alkes_clean_update ac
+        ON a.nama_rekanan_clean = ac.nama_alkes_clean
+
+  UNION
+
+ SELECT DISTINCT
+  a.nama_rekanan,
+  fc.nama_faskes_clean AS faskes_rekanan,
+  ac.nama_alkes_clean AS alkes_rekanan
+ FROM union_compre_lite_clean a
+ LEFT JOIN edl_sandbox.da_wholesale_nama_universe_faskes_clean fc
+        ON a.nocif_rekanan = fc.nocif_faskes
+  LEFT JOIN edl_sandbox.da_wholesale_alkes_clean_update ac
+        ON a.nocif_rekanan = ac.nocif_alkes
+),
+
+-- All facility-to-alkes transactions, covering both the principal and the counterparty cases
+tmp_trx AS (
+ SELECT a.*,
+  pf.faskes_principal,
+  pf.alkes_principal,
+  rf.faskes_rekanan,
+  rf.alkes_rekanan
+ FROM edl_sandbox.whmart_union_compre_lite_aug_fix a
+ LEFT JOIN tmp_principal_tag pf
+    ON pf.nama_principal = a.nama_principal
+ LEFT JOIN tmp_rekanan_tag rf
+    ON rf.nama_rekanan = a.nama_rekanan
+  WHERE (pf.faskes_principal IS NOT NULL AND rf.alkes_rekanan IS NOT NULL AND debit_vol IS NOT NULL)
+    OR (pf.alkes_principal IS NOT NULL AND rf.faskes_rekanan IS NOT NULL AND credit_vol IS NOT NULL)
+)
+
+SELECT *
+FROM tmp_trx;
+
+-- Export the data to look at the transaction details
+-- select *
+-- from edl_sandbox.da_wholesale_trx_outgoing_faskes_alkes_only
+
+
+/* ---------------------------------------------------------------------
+   STEP 20 : SUMMARY OF ALL OUTGOING FACILITY TRANSACTIONS (PBF + ALKES)
+   Purpose : Union of the facility-to-PBF (Step 18) and facility-to-alkes (Step 19) transactions.
+   Source  : da_wholesale_trx_outgoing_faskes_pbf_only, da_wholesale_trx_outgoing_faskes_alkes_only
+   Result  : edl_sandbox.da_wholesale_trx_outgoing_faskes_all
+   --------------------------------------------------------------------- */
+
+-- drop table edl_sandbox.da_wholesale_trx_outgoing_faskes_all
+CREATE TABLE edl_sandbox.da_wholesale_trx_outgoing_faskes_all
+STORED AS PARQUET
+AS
+SELECT
+  po.*,
+  'faskes to pbf' AS source_trx
+FROM edl_sandbox.da_wholesale_trx_outgoing_faskes_pbf_only po  -- all transactions from facilities to PBF
+UNION
+SELECT
+  ao.*,
+  'faskes to alkes' AS source_trx
+FROM edl_sandbox.da_wholesale_trx_outgoing_faskes_alkes_only ao;  -- all transactions from facilities to medical-device companies
