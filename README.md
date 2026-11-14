@@ -134,11 +134,19 @@ Other Indonesian words in table and column names: *nasabah* (customer), *instans
 
 ---
 
-## Requirements
+## Repository Structure
 
-- Access to the BSI data lake schemas listed above (internal; not included in this repository).
-- A SQL engine with `LEVENSHTEIN`, `REGEXP_REPLACE`, window functions and Parquet support (the syntax is Hive-style).
+```text
+transaction-flow-analysis/
+│
+├── README.md
+└── sql_script.sql
+```
 
-## Notes
+*Note: The repository structure represents a suggested organization of the analytical workflow.*
 
-This repository contains **query logic only**. It contains no customer data, and results should not be committed here.
+## Author
+
+**Rudi Julianto**
+
+Data Analyst
